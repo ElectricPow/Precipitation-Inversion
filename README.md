@@ -195,12 +195,14 @@ precipitation-inversion/
 ├── ZRH_37refine.pth                         # 60层ZRH参数
 ├── zrh_nc_to_rain.py                        # 反射率批量转换为ZRH降水率
 ├── plot_2km_zrh_4files.py                   # 2km平面与A-B剖面对比绘图
+├── plot_nc_sample_diagnostics.py            # 单样本全变量与专题诊断绘图
 ├── requirements-zrh.txt                     # 转换脚本依赖
 ├── requirements-plot.txt                    # 绘图完整依赖
 ├── 数据集说明.md                            # 数据结构与物理含义
 ├── NC样本变量与数值分析.md                 # 单样本全变量统计
 ├── 运行ZRH转换脚本.md                       # 转换脚本使用说明
-└── 运行2km_ZRH绘图脚本.md                  # 绘图脚本使用说明
+├── 运行2km_ZRH绘图脚本.md                  # 六场对比绘图脚本使用说明
+└── 运行NC单样本诊断绘图.md                 # 全变量诊断脚本使用说明
 ```
 
 `.venv/`、`outputs/`、NetCDF 数据和临时文件不纳入版本控制。
@@ -266,6 +268,34 @@ outputs/plots_2km_zrh
 
 详细说明见[ZRH转换脚本运行说明](./运行ZRH转换脚本.md)和[2km绘图脚本运行说明](./运行2km_ZRH绘图脚本.md)。
 
+### 6.3 生成单样本全变量诊断报告
+
+```bash
+python plot_nc_sample_diagnostics.py
+```
+
+默认按文件名排序处理数据集前20个样本，每个样本生成23张逐变量图、8张总览/专题图、统计CSV和31页PDF。处理前10个样本：
+
+```bash
+python plot_nc_sample_diagnostics.py --count 10
+```
+
+已有完整样本结果默认跳过，异常中断且没有完成标记的样本会在下次运行时自动重建；需要主动更新完整结果时添加 `--overwrite`：
+
+```bash
+python plot_nc_sample_diagnostics.py --overwrite
+```
+
+也可以只分析一个指定文件：
+
+```bash
+python plot_nc_sample_diagnostics.py --input-file /path/to/sample.nc
+```
+
+批处理默认记录单样本异常并继续处理后续文件，最终统一汇总；调试时可使用 `--fail-fast` 在首个异常处停止。
+
+详细说明见[单样本诊断绘图运行说明](./运行NC单样本诊断绘图.md)。
+
 ## 7. 当前限制与待确认事项
 
 1. 当前定量统计主要来自一个轨道文件，尚不能代表整个数据集；
@@ -292,6 +322,6 @@ outputs/plots_2km_zrh
 - [单个NetCDF样本全变量与数值分析](./NC样本变量与数值分析.md)
 - [ZRH批量转换运行说明](./运行ZRH转换脚本.md)
 - [2km水平图与垂直剖面运行说明](./运行2km_ZRH绘图脚本.md)
+- [单样本全变量诊断绘图运行说明](./运行NC单样本诊断绘图.md)
 - `variables_schema-段晨阳.docx`：原始变量说明
 - `20260408雷达降水廓线反演-20260818.pptx`：项目背景与任务介绍
-
