@@ -196,10 +196,30 @@ precipitation-inversion/
 ├── zrh_nc_to_rain.py                        # 反射率批量转换为ZRH降水率
 ├── plot_2km_zrh_4files.py                   # 2km平面与A-B剖面对比绘图
 ├── plot_nc_sample_diagnostics.py            # 单样本全变量与专题诊断绘图
+├── scripts/
+│   ├── build_dataset_manifest.py          # 全数据集文件级审计与清单
+│   └── make_dataset_splits.py             # 按日期分组的无泄漏数据划分
+├── src/precipitation_inversion/data/
+│   ├── masks.py                           # GR/DPR/降水/cfb统一mask规则
+│   └── splits.py                          # 分组平衡划分核心逻辑
+├── tests/
+│   ├── test_masks.py                      # mask规则单元测试
+│   └── test_splits.py                     # 划分确定性和无泄漏测试
+├── metadata/manifests/
+│   ├── dataset_manifest.csv              # 254个文件的统计清单
+│   ├── dataset_summary.json              # 全数据集汇总
+│   └── failed_files.csv                  # 读取失败记录
+├── metadata/splits/
+│   ├── train_files.txt                   # 训练集NC路径
+│   ├── val_files.txt                     # 验证集NC路径
+│   ├── test_files.txt                    # 测试集NC路径
+│   ├── split_manifest.csv                # 带split字段的完整清单
+│   └── split_summary.json                # 划分平衡性与泄漏检查
 ├── requirements-zrh.txt                     # 转换脚本依赖
 ├── requirements-plot.txt                    # 绘图完整依赖
 ├── 数据集说明.md                            # 数据结构与物理含义
 ├── NC样本变量与数值分析.md                 # 单样本全变量统计
+├── 降水反演任务拆解与实验路线.md             # 三阶段任务拆解和实验清单
 ├── 运行ZRH转换脚本.md                       # 转换脚本使用说明
 ├── 运行2km_ZRH绘图脚本.md                  # 六场对比绘图脚本使用说明
 └── 运行NC单样本诊断绘图.md                 # 全变量诊断脚本使用说明
@@ -296,25 +316,61 @@ python plot_nc_sample_diagnostics.py --input-file /path/to/sample.nc
 
 详细说明见[单样本诊断绘图运行说明](./运行NC单样本诊断绘图.md)。
 
+### 6.4 生成全数据集审计清单
+
+默认扫描全部254个NC文件，保持源数据只读：
+
+```bash
+python scripts/build_dataset_manifest.py --workers 2
+```
+
+调试时只检查前10个文件：
+
+```bash
+python scripts/build_dataset_manifest.py \
+  --count 10 \
+  --output-dir /tmp/precipitation-manifest-debug \
+  --overwrite
+```
+
+正式输出位于 `metadata/manifests/`，包含文件级CSV、全数据集JSON汇总和失败文件记录。默认使用单进程；在共享存储上不宜盲目设置过多 `--workers`。
+
+### 6.5 生成训练、验证和测试划分
+
+默认以完整日期为不可分割组，使用10,000次固定种子候选搜索，尽量平衡GR覆盖、正降水、强降水尾部和降水类型：
+
+```bash
+python scripts/make_dataset_splits.py --overwrite
+```
+
+也可生成按时间连续切分的分布偏移对照组：
+
+```bash
+python scripts/make_dataset_splits.py \
+  --strategy chronological \
+  --output-dir /tmp/precipitation-splits-chronological \
+  --overwrite
+```
+
+正式平衡划分位于 `metadata/splits/`。同一日期的所有NC文件只会出现在一个集合中。
+
 ## 7. 当前限制与待确认事项
 
-1. 当前定量统计主要来自一个轨道文件，尚不能代表整个数据集；
+1. 已完成按日期隔离的划分，但相邻多日是否属于同一天气过程尚无事件级标注；
 2. 尚未从数据生成代码确认 GR–DPR 最大时间匹配误差；
 3. 尚未确认多雷达重叠区域的合并权重，以及均值是在 dBZ 空间还是线性反射率空间计算；
 4. 尚未确认 `dbz_gr_interp` 的具体插值算法、搜索半径和边界处理；
-5. 尚未建立轨道级训练/验证/测试划分；
-6. 尚未完成统一的定量基线评估和学习模型实验；
-7. 当前权重读取器针对仓库提供的 `ZRH_37refine.pth` 固定结构，不用于加载任意 PyTorch checkpoint。
+5. 尚未完成统一的定量基线评估和学习模型实验；
+6. 当前权重读取器针对仓库提供的 `ZRH_37refine.pth` 固定结构，不用于加载任意 PyTorch checkpoint。
 
 ## 8. 下一阶段计划
 
-1. 将单样本统计扩展到全部254个文件，统计覆盖率、降水分位数、类型分布和质量掩码；
-2. 按轨道文件划分训练、验证和测试集，避免相邻格点泄漏；
-3. 明确定义输入观测掩码、DPR有效标签掩码和 `cfb` 杂波掩码；
-4. 建立稀疏 Z–R、插值 Z–R 和简单稠密网络等可复现基线；
-5. 同时采用总体误差、正降水误差、分阈值指标和分降水类型指标；
-6. 研究长尾处理方法，例如分层采样、强降水加权和兼顾连续值与降水发生的联合目标；
-7. 在基线充分验证后，再比较显式掩码、部分卷积、稀疏卷积或其他稀疏到稠密模型路线。
+1. 建立统一的NC变量读取、mask应用、切块和归一化数据管线；
+2. 建立面向PyTorch的阶段一 DPR反射率–降水率数据集，且只用训练集计算统计量；
+3. 建立稀疏 Z–R、插值 Z–R 和简单稠密网络等可复现基线；
+4. 同时采用总体误差、正降水误差、分阈值指标和分降水类型指标；
+5. 研究长尾处理方法，例如分层采样、强降水加权和兼顾连续值与降水发生的联合目标；
+6. 在基线充分验证后，再比较显式掩码、部分卷积、稀疏卷积或其他稀疏到稠密模型路线。
 
 ## 9. 参考资料
 
@@ -323,5 +379,6 @@ python plot_nc_sample_diagnostics.py --input-file /path/to/sample.nc
 - [ZRH批量转换运行说明](./运行ZRH转换脚本.md)
 - [2km水平图与垂直剖面运行说明](./运行2km_ZRH绘图脚本.md)
 - [单样本全变量诊断绘图运行说明](./运行NC单样本诊断绘图.md)
+- [降水反演任务拆解与实验路线](./降水反演任务拆解与实验路线.md)
 - `variables_schema-段晨阳.docx`：原始变量说明
 - `20260408雷达降水廓线反演-20260818.pptx`：项目背景与任务介绍
