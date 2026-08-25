@@ -201,10 +201,12 @@ precipitation-inversion/
 │   └── make_dataset_splits.py             # 按日期分组的无泄漏数据划分
 ├── src/precipitation_inversion/data/
 │   ├── masks.py                           # GR/DPR/降水/cfb统一mask规则
-│   └── splits.py                          # 分组平衡划分核心逻辑
+│   ├── splits.py                          # 分组平衡划分核心逻辑
+│   └── nc_reader.py                       # 按变量/扫描区间读取NC并派生mask
 ├── tests/
 │   ├── test_masks.py                      # mask规则单元测试
-│   └── test_splits.py                     # 划分确定性和无泄漏测试
+│   ├── test_splits.py                     # 划分确定性和无泄漏测试
+│   └── test_nc_reader.py                  # 选择读取、维度和mask语义测试
 ├── metadata/manifests/
 │   ├── dataset_manifest.csv              # 254个文件的统计清单
 │   ├── dataset_summary.json              # 全数据集汇总
@@ -354,6 +356,26 @@ python scripts/make_dataset_splits.py \
 
 正式平衡划分位于 `metadata/splits/`。同一日期的所有NC文件只会出现在一个集合中。
 
+### 6.6 选择性读取NC样本
+
+`read_nc_sample` 只读取显式请求的变量，并可以统一裁剪连续的 `nscan` 区间：
+
+```python
+from precipitation_inversion.data.nc_reader import read_nc_sample
+
+sample = read_nc_sample(
+    "/path/to/sample.nc",
+    variables=("z", "dbz_dpr", "pre_dpr", "cfb"),
+    scan_slice=slice(100, 132),
+)
+
+dbz = sample.variables["dbz_dpr"]
+positive = sample.masks["pre_positive_native"]
+trainable = sample.masks["pre_positive_qc"]
+```
+
+默认返回 `float32`，缺测保留为NaN。`pre_valid_native` 表示原始有效降水标签，`pre_valid_qc` 还会剔除 `cfb` 以下的杂波区域。
+
 ## 7. 当前限制与待确认事项
 
 1. 已完成按日期隔离的划分，但相邻多日是否属于同一天气过程尚无事件级标注；
@@ -365,8 +387,8 @@ python scripts/make_dataset_splits.py \
 
 ## 8. 下一阶段计划
 
-1. 建立统一的NC变量读取、mask应用、切块和归一化数据管线；
-2. 建立面向PyTorch的阶段一 DPR反射率–降水率数据集，且只用训练集计算统计量；
+1. 建立归一化与填充变换，并严格只用训练集拟合统计量；
+2. 建立面向PyTorch的阶段一 DPR反射率–降水率数据集，支持文件级读取、切块和正降水样本索引；
 3. 建立稀疏 Z–R、插值 Z–R 和简单稠密网络等可复现基线；
 4. 同时采用总体误差、正降水误差、分阈值指标和分降水类型指标；
 5. 研究长尾处理方法，例如分层采样、强降水加权和兼顾连续值与降水发生的联合目标；

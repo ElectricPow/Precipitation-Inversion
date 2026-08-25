@@ -4,6 +4,6 @@ __pycache__/
 outputs/
 *.partial
 *.nc
-data/
+/data/
 .DS_Store
 ~$*
