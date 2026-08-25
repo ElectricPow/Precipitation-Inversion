@@ -198,15 +198,23 @@ precipitation-inversion/
 ├── plot_nc_sample_diagnostics.py            # 单样本全变量与专题诊断绘图
 ├── scripts/
 │   ├── build_dataset_manifest.py          # 全数据集文件级审计与清单
-│   └── make_dataset_splits.py             # 按日期分组的无泄漏数据划分
+│   ├── make_dataset_splits.py             # 按日期分组的无泄漏数据划分
+│   ├── fit_normalization_stats.py         # 仅用训练集拟合分高度归一化量
+│   └── build_stage1_sample_index.py       # 构建阶段一正降水体素索引
 ├── src/precipitation_inversion/data/
 │   ├── masks.py                           # GR/DPR/降水/cfb统一mask规则
 │   ├── splits.py                          # 分组平衡划分核心逻辑
-│   └── nc_reader.py                       # 按变量/扫描区间读取NC并派生mask
+│   ├── nc_reader.py                       # 按变量/扫描区间读取NC并派生mask
+│   ├── transforms.py                      # 在线统计、标准化与降水可逆变换
+│   ├── dataset.py                         # 紧凑索引及PyTorch Dataset
+│   └── samplers.py                        # 文件/块级洗牌及DDP批次分片
 ├── tests/
 │   ├── test_masks.py                      # mask规则单元测试
 │   ├── test_splits.py                     # 划分确定性和无泄漏测试
-│   └── test_nc_reader.py                  # 选择读取、维度和mask语义测试
+│   ├── test_nc_reader.py                  # 选择读取、维度和mask语义测试
+│   ├── test_transforms.py                 # 分块统计等价性和变换可逆性测试
+│   ├── test_dataset.py                    # 索引、缓存和DataLoader测试
+│   └── test_samplers.py                   # 采样完整性、确定性及DDP分片测试
 ├── metadata/manifests/
 │   ├── dataset_manifest.csv              # 254个文件的统计清单
 │   ├── dataset_summary.json              # 全数据集汇总
@@ -217,8 +225,14 @@ precipitation-inversion/
 │   ├── test_files.txt                    # 测试集NC路径
 │   ├── split_manifest.csv                # 带split字段的完整清单
 │   └── split_summary.json                # 划分平衡性与泄漏检查
+├── metadata/normalization/
+│   └── stage1_positive_qc.json           # 阶段一训练集分高度统计量
+├── metadata/stage1_indices/              # 本机生成，Git忽略
+│   ├── train.npy / val.npy / test.npy    # 6字节/体素的内存映射索引
+│   └── train.json / val.json / test.json # 索引来源、哈希和文件范围
 ├── requirements-zrh.txt                     # 转换脚本依赖
 ├── requirements-plot.txt                    # 绘图完整依赖
+├── requirements-training.txt                # 阶段一PyTorch依赖
 ├── 数据集说明.md                            # 数据结构与物理含义
 ├── NC样本变量与数值分析.md                 # 单样本全变量统计
 ├── 降水反演任务拆解与实验路线.md             # 三阶段任务拆解和实验清单
@@ -238,6 +252,7 @@ precipitation-inversion/
 - netCDF4 1.6.2
 - Matplotlib 3.8.4
 - Pillow 12.3.0
+- PyTorch 2.8.0+cu128
 
 创建并激活环境：
 
@@ -246,6 +261,7 @@ cd /home/koujizhi/projects/precipitation-inversion
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-plot.txt
+python -m pip install -r requirements-training.txt
 ```
 
 每次新开终端都需要重新执行：
@@ -376,6 +392,84 @@ trainable = sample.masks["pre_positive_qc"]
 
 默认返回 `float32`，缺测保留为NaN。`pre_valid_native` 表示原始有效降水标签，`pre_valid_qc` 还会剔除 `cfb` 以下的杂波区域。
 
+### 6.7 拟合阶段一归一化统计量
+
+默认仅读取 `train_files.txt` 中的175个文件，并与 `split_manifest.csv` 交叉检查，遇到验证或测试文件会直接报错：
+
+```bash
+python scripts/fit_normalization_stats.py --overwrite
+```
+
+默认在 `pre_positive_qc` 网格上按60个高度层分别统计 `dbz_dpr/p/t/q` 的数量、均值、标准差和范围。调试时可限制文件数：
+
+```bash
+python scripts/fit_normalization_stats.py \
+  --max-files 2 \
+  --output /tmp/stage1-normalization-smoke.json \
+  --overwrite
+```
+
+正式结果保存在 `metadata/normalization/stage1_positive_qc.json`。统计共使用5,481,557个训练网格；由于 `cfb` 近地面杂波质控，0.125 km和0.375 km两层没有可训练正降水样本，其统计量以 `null` 保存。
+
+### 6.8 构建并读取阶段一体素索引
+
+按训练、验证、测试文件清单生成索引：
+
+```bash
+python scripts/build_stage1_sample_index.py --split all
+```
+
+索引只保留同时满足 `pre_positive_qc`、DPR反射率有效且 `dbz_dpr/p/t/q` 均为有限值的体素。每条记录仅保存 `file_id/scan/ray/level`，占6字节；三组真实数据索引共约45 MiB，属于可再生文件，因此不提交Git。
+
+```python
+from precipitation_inversion.data.dataset import Stage1IntensityDataset
+
+dataset = Stage1IntensityDataset(
+    "metadata/stage1_indices/train.json",
+    "metadata/normalization/stage1_positive_qc.json",
+)
+item = dataset[0]
+# features: 标准化后的 dbz_dpr/p/t/q 和缩放高度，共5维
+# target: log(1 + pre_dpr)
+```
+
+Dataset以内存映射方式读取索引，并为每个DataLoader进程维护独立的NetCDF文件LRU缓存。索引按文件连续排列；后续训练采样器宜按文件块洗牌，再在块内洗牌，避免全局随机访问反复淘汰缓存。
+
+### 6.9 使用文件块批采样器
+
+阶段一训练不应再向DataLoader传入全局 `shuffle=True`。使用批采样器后，文件顺序、文件内块顺序和块内样本都会随epoch确定性地洗牌，但每个batch仍只读取一个NC文件：
+
+```python
+import torch
+
+from precipitation_inversion.data.dataset import Stage1IntensityDataset
+from precipitation_inversion.data.samplers import FileBlockBatchSampler
+
+dataset = Stage1IntensityDataset(
+    "metadata/stage1_indices/train.json",
+    "metadata/normalization/stage1_positive_qc.json",
+)
+sampler = FileBlockBatchSampler(
+    dataset,
+    batch_size=256,
+    block_size=4096,  # 16个batch组成一个局部洗牌块
+    seed=2026,
+    drop_last=True,
+)
+loader = torch.utils.data.DataLoader(
+    dataset,
+    batch_sampler=sampler,
+    num_workers=2,
+)
+
+for epoch in range(100):
+    sampler.set_epoch(epoch)
+    for batch in loader:
+        pass
+```
+
+设置 `batch_sampler` 后不能再同时设置DataLoader的 `batch_size/shuffle/drop_last`。采样器支持 `num_replicas/rank`；若DDP进程组已初始化，则会自动读取world size和当前rank。默认 `even_batches=True`，会舍弃至多 `world_size-1` 个全局batch，使所有rank执行相同步数，避免同步训练挂起。
+
 ## 7. 当前限制与待确认事项
 
 1. 已完成按日期隔离的划分，但相邻多日是否属于同一天气过程尚无事件级标注；
@@ -387,12 +481,12 @@ trainable = sample.masks["pre_positive_qc"]
 
 ## 8. 下一阶段计划
 
-1. 建立归一化与填充变换，并严格只用训练集拟合统计量；
-2. 建立面向PyTorch的阶段一 DPR反射率–降水率数据集，支持文件级读取、切块和正降水样本索引；
-3. 建立稀疏 Z–R、插值 Z–R 和简单稠密网络等可复现基线；
-4. 同时采用总体误差、正降水误差、分阈值指标和分降水类型指标；
-5. 研究长尾处理方法，例如分层采样、强降水加权和兼顾连续值与降水发生的联合目标；
-6. 在基线充分验证后，再比较显式掩码、部分卷积、稀疏卷积或其他稀疏到稠密模型路线。
+1. 编写阶段一MLP强度回归基线、损失函数和训练入口；
+2. 建立验证指标与checkpoint/配置记录，先验证 `dbz_dpr → pre_dpr` 条件强度映射；
+3. 比较MSE、MAE、Huber及强降水加权损失；
+4. 建立现有分层Z–R方法在相同测试网格上的定量基线；
+5. 在MLP基线稳定后，引入垂直廓线一维CNN并比较辅助变量消融；
+6. 最后再进入小型3D CNN及阶段二GR→DPR映射。
 
 ## 9. 参考资料
 
