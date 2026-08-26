@@ -200,21 +200,51 @@ precipitation-inversion/
 │   ├── build_dataset_manifest.py          # 全数据集文件级审计与清单
 │   ├── make_dataset_splits.py             # 按日期分组的无泄漏数据划分
 │   ├── fit_normalization_stats.py         # 仅用训练集拟合分高度归一化量
-│   └── build_stage1_sample_index.py       # 构建阶段一正降水体素索引
+│   ├── build_stage1_sample_index.py       # 构建阶段一正降水体素索引
+│   ├── build_stage1_patch_index.py        # 构建3D核心+上下文窗口索引
+│   ├── check_distributed_runtime.py       # 低显存NCCL/DDP通信自检
+│   ├── launch_stage1_ddp.sh               # 共享服务器安全的单机多卡入口
+│   ├── train_stage1_unet3d.py             # 单卡/DDP训练、验证和checkpoint
+│   ├── plot_stage1_training_history.py    # 逐epoch曲线、分箱及泛化分析
+│   ├── visualize_stage1_test_predictions.py # best.pt固定测试轨道诊断
+│   └── evaluate_stage1_unet3d.py          # Patch指标与完整轨道评估
+├── configs/
+│   └── stage1_unet3d.yaml                 # 第一版模型和训练参数
 ├── src/precipitation_inversion/data/
 │   ├── masks.py                           # GR/DPR/降水/cfb统一mask规则
 │   ├── splits.py                          # 分组平衡划分核心逻辑
 │   ├── nc_reader.py                       # 按变量/扫描区间读取NC并派生mask
 │   ├── transforms.py                      # 在线统计、标准化与降水可逆变换
 │   ├── dataset.py                         # 紧凑索引及PyTorch Dataset
-│   └── samplers.py                        # 文件/块级洗牌及DDP批次分片
+│   ├── samplers.py                        # 文件/块级洗牌及DDP批次分片
+│   └── patch_dataset.py                   # 3D U-Net核心+halo Patch Dataset
+├── src/precipitation_inversion/inference/
+│   └── sliding_window.py                  # 中心核心裁剪与完整轨道重建
+├── src/precipitation_inversion/models/
+│   ├── blocks3d.py                        # 保持高度的各向异性3D残差块
+│   └── unet3d.py                          # 阶段一高度保持3D U-Net
+├── src/precipitation_inversion/losses/
+│   └── masked_losses.py                   # mask内Smooth L1/MSE/MAE
+├── src/precipitation_inversion/metrics/
+│   └── regression.py                      # 流式log/物理空间回归指标
+├── src/precipitation_inversion/training/
+│   └── engine.py                          # AMP/DDP epoch循环和checkpoint
 ├── tests/
 │   ├── test_masks.py                      # mask规则单元测试
 │   ├── test_splits.py                     # 划分确定性和无泄漏测试
 │   ├── test_nc_reader.py                  # 选择读取、维度和mask语义测试
 │   ├── test_transforms.py                 # 分块统计等价性和变换可逆性测试
 │   ├── test_dataset.py                    # 索引、缓存和DataLoader测试
-│   └── test_samplers.py                   # 采样完整性、确定性及DDP分片测试
+│   ├── test_samplers.py                   # 采样完整性、确定性及DDP分片测试
+│   ├── test_patch_dataset.py              # Patch形状、padding和halo测试
+│   ├── test_sliding_window.py             # 核心拼接与整轨推理测试
+│   ├── test_unet3d.py                     # 高度保持和模型梯度测试
+│   ├── test_masked_losses.py              # mask归约和梯度隔离测试
+│   ├── test_regression_metrics.py         # 指标、强度分箱和流式合并测试
+│   ├── test_distributed_configuration.py  # DDP设备绑定及配置安全检查
+│   ├── test_training_visualization.py     # 训练JSONL解析与图表输出测试
+│   ├── test_prediction_visualization.py   # 固定抽样、指标及诊断图测试
+│   └── test_training_engine.py            # 参数更新和checkpoint恢复测试
 ├── metadata/manifests/
 │   ├── dataset_manifest.csv              # 254个文件的统计清单
 │   ├── dataset_summary.json              # 全数据集汇总
@@ -230,12 +260,16 @@ precipitation-inversion/
 ├── metadata/stage1_indices/              # 本机生成，Git忽略
 │   ├── train.npy / val.npy / test.npy    # 6字节/体素的内存映射索引
 │   └── train.json / val.json / test.json # 索引来源、哈希和文件范围
+├── metadata/stage1_patch_indices/        # 本机生成，Git忽略
+│   ├── train.npy / val.npy / test.npy    # 非重叠nscan核心窗口索引
+│   └── train.json / val.json / test.json # halo、padding和文件范围
 ├── requirements-zrh.txt                     # 转换脚本依赖
 ├── requirements-plot.txt                    # 绘图完整依赖
 ├── requirements-training.txt                # 阶段一PyTorch依赖
 ├── 数据集说明.md                            # 数据结构与物理含义
 ├── NC样本变量与数值分析.md                 # 单样本全变量统计
 ├── 降水反演任务拆解与实验路线.md             # 三阶段任务拆解和实验清单
+├── 模型数据处理流程与张量形状.md             # 模型输入处理、变量和shape查询
 ├── 运行ZRH转换脚本.md                       # 转换脚本使用说明
 ├── 运行2km_ZRH绘图脚本.md                  # 六场对比绘图脚本使用说明
 └── 运行NC单样本诊断绘图.md                 # 全变量诊断脚本使用说明
@@ -470,6 +504,168 @@ for epoch in range(100):
 
 设置 `batch_sampler` 后不能再同时设置DataLoader的 `batch_size/shuffle/drop_last`。采样器支持 `num_replicas/rank`；若DDP进程组已初始化，则会自动读取world size和当前rank。默认 `even_batches=True`，会舍弃至多 `world_size-1` 个全局batch，使所有rank执行相同步数，避免同步训练挂起。
 
+### 6.10 构建3D U-Net Patch并重建完整轨道
+
+默认使用32个扫描线的非重叠输出核心，以及左右各16个扫描线的上下文：
+
+```bash
+python scripts/build_stage1_patch_index.py --split all
+```
+
+原始窗口 `(64,49,60)` 只在横轨高端补齐为 `(64,64,60)`，不增加虚假高度层。
+Dataset的三个输入通道是标准化DPR反射率、显式有效性mask和缩放至 `[-1,1]`
+的高度坐标：
+
+```python
+from precipitation_inversion.data.patch_dataset import Stage1PatchDataset
+
+train_dataset = Stage1PatchDataset(
+    "metadata/stage1_patch_indices/train.json",
+    "metadata/normalization/stage1_positive_qc.json",
+    positive_only=True,
+)
+item = train_dataset[0]
+print(item["inputs"].shape)     # (3,64,64,60)
+print(item["target"].shape)     # (1,64,64,60)
+print(item["loss_mask"].shape)  # (1,64,64,60)
+```
+
+训练时 `positive_only=True` 过滤没有正降水loss体素的核心；验证和整轨测试必须使用
+`positive_only=False`，以完整覆盖原始 `nscan`。高度保持3D U-Net只在扫描和横轨
+方向以 `(2,2,1)` 下采样，模型输出 `(B,1,64,64,60)` 后，可使用
+`predict_full_orbit` 自动取每个窗口的中心32扫描线并拼成 `(nscan,49,60)`：
+
+```python
+from precipitation_inversion.inference.sliding_window import predict_full_orbit
+
+rain = predict_full_orbit(model, test_dataset, file_id=0, device="cuda")
+```
+
+### 6.11 训练和评估高度保持3D U-Net
+
+配置文件 `configs/stage1_unet3d.yaml` 使用JSON兼容的YAML 1.2语法，因此当前环境
+不安装PyYAML也能直接由标准库读取。单GPU训练：
+
+```bash
+python scripts/train_stage1_unet3d.py --device cuda:0
+```
+
+多GPU训练前先在服务器监视器 `http://211.86.155.236:8081/` 或终端确认空闲卡：
+
+```bash
+nvidia-smi
+nvidia-smi pmon -c 1
+```
+
+启动脚本要求显式声明物理GPU，防止共享服务器上误占他人正在使用的卡。例如用物理
+5、6号卡做两卡训练（进程内分别映射为 `cuda:0`、`cuda:1`）：
+
+```bash
+CUDA_VISIBLE_DEVICES=5,6 \
+STAGE1_MASTER_PORT=29519 \
+scripts/launch_stage1_ddp.sh
+```
+
+八卡均确认空闲时才启动八卡训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+STAGE1_NUM_GPUS=8 \
+STAGE1_MASTER_PORT=29519 \
+scripts/launch_stage1_ddp.sh
+```
+
+同一服务器上的不同分布式任务必须使用不同的 `STAGE1_MASTER_PORT`。正式训练前可先
+运行低显存通信自检；它检查进程绑定、NCCL collective和DDP梯度同步，不读取NC数据：
+
+```bash
+CUDA_VISIBLE_DEVICES=5,6 .venv/bin/torchrun \
+  --nnodes=1 --nproc-per-node=2 \
+  --master-addr=127.0.0.1 --master-port=29518 \
+  scripts/check_distributed_runtime.py
+```
+
+`data.batch_size` 是每张GPU的batch大小，当前为1。有效全局batch为
+`每卡batch × GPU数 × accumulation_steps`；两卡为2、八卡为8。第一轮实验先保持
+学习率 `1e-4`，不要因GPU数自动线性放大；得到稳定曲线后再单独比较学习率。训练与
+验证采样器都保证各rank步数相同，最多舍弃 `world_size-1` 个batch以避免collective
+死锁；训练指标会在所有rank上聚合，checkpoint仅由rank 0写入。
+
+断点恢复和两批次烟雾测试：
+
+```bash
+python scripts/train_stage1_unet3d.py \
+  --resume outputs/stage1_unet3d/last.pt \
+  --device cuda:0
+
+python scripts/train_stage1_unet3d.py \
+  --smoke-test \
+  --output-dir outputs/stage1_unet3d_smoke \
+  --device cuda:0
+```
+
+训练入口每个epoch记录log空间及mm/h空间的MAE、RMSE、Bias、R²、Pearson相关系数，
+并按目标降水率 `<1/1–5/5–10/10–30/≥30 mm/h` 分箱。默认以验证集物理空间RMSE
+选择 `best.pt`，同时保存 `last.pt` 和逐epoch checkpoint。
+
+完整训练正常结束后，只有DDP rank 0会自动执行两个后处理脚本。配置由
+`postprocessing` 控制，默认固定随机种子2026，从测试集中有正降水监督的轨道里抽取
+6条完整轨道。所有结果写入本次命令实际指定的output目录：
+
+```text
+outputs/<experiment>/analysis/
+├── README.md
+├── training_history/
+│   ├── training_overview.png
+│   ├── validation_intensity_bins.png
+│   ├── generalization_gap.png
+│   ├── epoch_metrics.csv
+│   ├── summary.json
+│   └── summary.md
+└── test_predictions/
+    ├── aggregate_diagnostics.png
+    ├── summary.json
+    ├── summary.md
+    └── sample_XX/
+        ├── diagnostics.png
+        ├── metrics.json
+        └── prediction_and_target.npz
+```
+
+`diagnostics.png`包括约2 km平面降水图、自动选择的A–B剖面、预测误差、正降水
+分布、`log1p`相关性和分高度RMSE/Bias/Pearson相关系数。自动后处理失败默认不会删除
+已经训练好的checkpoint；如希望后处理失败也令训练命令返回非零状态，可设置
+`postprocessing.fail_on_error=true`。调试训练时可传入 `--skip-postprocessing`。
+
+已有训练也可随时手动重跑：
+
+```bash
+python scripts/plot_stage1_training_history.py outputs/stage1_unet3d_3gpu
+
+CUDA_VISIBLE_DEVICES=7 python scripts/visualize_stage1_test_predictions.py \
+  outputs/stage1_unet3d_3gpu/best.pt \
+  --output-dir outputs/stage1_unet3d_3gpu/analysis/test_predictions \
+  --sample-count 6 --seed 2026 --device cuda:0
+```
+
+Patch评估及一条完整轨道重建：
+
+```bash
+python scripts/evaluate_stage1_unet3d.py \
+  outputs/stage1_unet3d/best.pt \
+  --split test \
+  --device cuda:0
+
+python scripts/evaluate_stage1_unet3d.py \
+  outputs/stage1_unet3d/best.pt \
+  --split test \
+  --full-orbits 1 \
+  --device cuda:0
+```
+
+完整轨道模式把非重叠核心重建为 `(nscan,49,60)`，在 `pre_positive_qc` 上计算
+条件强度指标，并把预测、标签和评价mask保存为压缩NPZ。
+
 ## 7. 当前限制与待确认事项
 
 1. 已完成按日期隔离的划分，但相邻多日是否属于同一天气过程尚无事件级标注；
@@ -478,15 +674,20 @@ for epoch in range(100):
 4. 尚未确认 `dbz_gr_interp` 的具体插值算法、搜索半径和边界处理；
 5. 尚未完成统一的定量基线评估和学习模型实验；
 6. 当前权重读取器针对仓库提供的 `ZRH_37refine.pth` 固定结构，不用于加载任意 PyTorch checkpoint。
+7. 已在物理5、6号RTX 4090 D上完成两卡NCCL collective、DDP反向传播以及真实NC
+   数据/完整3D U-Net的训练与验证冒烟测试。当前受管执行环境在建立 `TCPStore` 时会
+   重复报告hostname解析警告并使初始化延迟约40秒，但最终通信正确；若用户终端也出现
+   长时间停顿，应检查 `/etc/hosts`、主机名解析、本地socket权限和端口冲突。
+8. 尚未在八卡同时空闲时做八进程实测；代码路径与两卡相同，但正式启动前仍需确认
+   所有目标GPU空闲，并先用8进程运行 `check_distributed_runtime.py`。
 
 ## 8. 下一阶段计划
 
-1. 编写阶段一MLP强度回归基线、损失函数和训练入口；
-2. 建立验证指标与checkpoint/配置记录，先验证 `dbz_dpr → pre_dpr` 条件强度映射；
-3. 比较MSE、MAE、Huber及强降水加权损失；
-4. 建立现有分层Z–R方法在相同测试网格上的定量基线；
-5. 在MLP基线稳定后，引入垂直廓线一维CNN并比较辅助变量消融；
-6. 最后再进入小型3D CNN及阶段二GR→DPR映射。
+1. 正式运行第一版训练并检查学习曲线、过拟合和强降水分箱指标；
+2. 建立现有分层Z–R方法在相同测试mask上的定量指标并与3D U-Net比较；
+3. 比较Smooth L1、MSE、MAE和训练集频率拟合的强降水加权损失；
+4. 增加预测—标签平面图、垂直剖面和强降水误差诊断；
+5. 第一版稳定后再加入 `p/t/q` 做消融，随后进入阶段二GR→DPR分布映射。
 
 ## 9. 参考资料
 
@@ -496,5 +697,6 @@ for epoch in range(100):
 - [2km水平图与垂直剖面运行说明](./运行2km_ZRH绘图脚本.md)
 - [单样本全变量诊断绘图运行说明](./运行NC单样本诊断绘图.md)
 - [降水反演任务拆解与实验路线](./降水反演任务拆解与实验路线.md)
+- [模型数据处理流程、变量与张量形状](./模型数据处理流程与张量形状.md)
 - `variables_schema-段晨阳.docx`：原始变量说明
 - `20260408雷达降水廓线反演-20260818.pptx`：项目背景与任务介绍

@@ -44,6 +44,15 @@ from .dataset import (
     build_stage1_index_records,
 )
 from .samplers import FileBlockBatchSampler, FileIndexRange, file_ranges_from_dataset
+from .patch_dataset import (
+    PATCH_INDEX_DTYPE,
+    PATCH_INDEX_FORMAT_VERSION,
+    PATCH_INPUT_CHANNELS,
+    Stage1PatchDataset,
+    build_stage1_patch_index_records,
+    ceil_to_multiple,
+    core_starts,
+)
 
 __all__ = [
     "clutter_mask_from_cfb",
@@ -82,4 +91,11 @@ __all__ = [
     "FileBlockBatchSampler",
     "FileIndexRange",
     "file_ranges_from_dataset",
+    "PATCH_INDEX_DTYPE",
+    "PATCH_INDEX_FORMAT_VERSION",
+    "PATCH_INPUT_CHANNELS",
+    "Stage1PatchDataset",
+    "build_stage1_patch_index_records",
+    "ceil_to_multiple",
+    "core_starts",
 ]

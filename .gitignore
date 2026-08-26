@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 outputs/
 metadata/stage1_indices/
+metadata/stage1_patch_indices/
 *.partial
 *.nc
 /data/
