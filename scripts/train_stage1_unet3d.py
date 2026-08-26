@@ -26,9 +26,15 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from precipitation_inversion.data.patch_dataset import Stage1PatchDataset  # noqa: E402
+from precipitation_inversion.data.patch_dataset import (  # noqa: E402
+    Stage1PatchDataset,
+    stage1_patch_dataset_kwargs,
+)
 from precipitation_inversion.data.samplers import FileBlockBatchSampler  # noqa: E402
 from precipitation_inversion.losses.masked_losses import MaskedSmoothL1Loss  # noqa: E402
+from precipitation_inversion.metrics.regression import (  # noqa: E402
+    StratifiedPrecipitationMetrics,
+)
 from precipitation_inversion.models.unet3d import Stage1UNet3D  # noqa: E402
 from precipitation_inversion.training.engine import (  # noqa: E402
     evaluate_one_epoch,
@@ -184,7 +190,7 @@ def _postprocessing_environment() -> dict[str, str]:
 def run_postprocessing(
     output_dir: Path, config: Mapping[str, Any], *, skip: bool = False
 ) -> None:
-    """Run CPU history plots then best-checkpoint test diagnostics once."""
+    """Run history, full-validation/dRdz, and test diagnostics once."""
 
     values = config.get("postprocessing", {})
     if skip or not bool(values.get("enabled", True)):
@@ -200,6 +206,27 @@ def run_postprocessing(
             sys.executable,
             str(PROJECT_ROOT / "scripts" / "plot_stage1_training_history.py"),
             str(output_dir),
+            "--dpi",
+            str(int(values.get("dpi", 150))),
+        ],
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "evaluate_stage1_unet3d.py"),
+            str(best_checkpoint),
+            "--split",
+            "val",
+            "--stratified",
+            "--device",
+            str(values.get("device", "auto")),
+            "--output",
+            str(output_dir / "analysis" / "full_validation" / "metrics.json"),
+        ],
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "plot_stage1_stratified_metrics.py"),
+            str(output_dir / "analysis" / "full_validation" / "metrics.json"),
+            "--output-dir",
+            str(output_dir / "analysis" / "full_validation" / "stratified"),
             "--dpi",
             str(int(values.get("dpi", 150))),
         ],
@@ -232,6 +259,10 @@ def run_postprocessing(
     (analysis_directory / "README.md").write_text(
         "# Stage-1训练后自动分析\n\n"
         "- [训练历史、强度分箱和泛化间隙](training_history/summary.md)\n"
+        "- [完整验证集分高度、相对CFB、强度及降水类型分析]"
+        "(full_validation/stratified/summary.md)\n"
+        "- [物理垂直降水率梯度dR/dz分析]"
+        "(full_validation/stratified/drdz_summary.md)\n"
         "- [固定测试轨道预测与DPR标签对比](test_predictions/summary.md)\n\n"
         "详细PNG、CSV、JSON和逐轨NPZ位于对应子目录。\n",
         encoding="utf-8",
@@ -254,10 +285,10 @@ def build_loader(
         shuffle=training,
         drop_last=training,
         seed=seed,
-        # DDP forward can contain synchronization collectives. Keep validation
-        # ranks equally long too, otherwise a short rank may leave the loop
-        # while another rank is still inside a DDP forward.
-        even_batches=True,
+        # Training requires equal-length shards for DDP backward. Validation
+        # uses the unwrapped, already-synchronized module for forward passes,
+        # so uneven disjoint shards safely retain every patch exactly once.
+        even_batches=training,
     )
     workers = int(data_config["num_workers"])
     loader = torch.utils.data.DataLoader(
@@ -311,6 +342,7 @@ def main() -> None:
     experiment = config["experiment"]
     data_config = config["data"]
     training_config = config["training"]
+    loss_config = config["loss"]
     seed = int(experiment["seed"])
     seed_everything(
         seed + rank,
@@ -344,18 +376,30 @@ def main() -> None:
             json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    dataset_options = stage1_patch_dataset_kwargs(data_config, loss_config)
     train_dataset = Stage1PatchDataset(
         project_path(data_config["train_index"]),
         project_path(data_config["normalization"]),
         positive_only=bool(data_config["train_positive_only"]),
         cache_size=int(data_config["cache_size"]),
+        **dataset_options,
     )
     val_dataset = Stage1PatchDataset(
         project_path(data_config["val_index"]),
         project_path(data_config["normalization"]),
         positive_only=bool(data_config["val_positive_only"]),
         cache_size=int(data_config["cache_size"]),
+        **dataset_options,
     )
+    expected_channels = int(config["model"]["in_channels"])
+    if len(train_dataset.feature_names) != expected_channels:
+        raise ValueError(
+            "model.in_channels does not match the configured Dataset: "
+            f"model={expected_channels}, dataset={len(train_dataset.feature_names)} "
+            f"({train_dataset.feature_names})"
+        )
+    if val_dataset.feature_names != train_dataset.feature_names:
+        raise ValueError("training and validation input channels differ")
     train_loader, train_sampler = build_loader(
         train_dataset, config, training=True, seed=seed
     )
@@ -401,7 +445,6 @@ def main() -> None:
     )
     if scheduler_name not in ("none", "cosine"):
         raise ValueError("scheduler name must be 'none' or 'cosine'")
-    loss_config = config["loss"]
     if str(loss_config["name"]).lower() != "masked_smooth_l1":
         raise ValueError("only masked_smooth_l1 is currently supported")
     criterion = MaskedSmoothL1Loss(beta=float(loss_config["beta"]))
@@ -412,10 +455,47 @@ def main() -> None:
         init_scale=float(training_config.get("amp_initial_scale", 1024.0)),
     )
     thresholds = tuple(float(value) for value in loss_config["thresholds_mm_h"])
+    stratified_config = config.get("evaluation", {}).get("stratified", {})
+    stratified_metrics: StratifiedPrecipitationMetrics | None = None
+    if bool(stratified_config.get("enabled", False)):
+        height_edges = stratified_config.get("height_bin_edges_km")
+        common_stratified_options = {
+            "cfb_distance_edges_km": tuple(
+                float(value)
+                for value in stratified_config.get(
+                    "cfb_distance_edges_km", (-1.0, 0.0, 0.5, 2.0)
+                )
+            ),
+            "intensity_thresholds_mm_h": thresholds,
+        }
+        stratified_metrics = (
+            StratifiedPrecipitationMetrics(
+                val_dataset.z.tolist(), **common_stratified_options
+            )
+            if height_edges is None
+            else StratifiedPrecipitationMetrics(
+                height_bin_edges_km=tuple(float(value) for value in height_edges),
+                **common_stratified_options,
+            )
+        )
 
     start_epoch = 0
     global_step = 0
     best_rmse = math.inf
+    early_stopping = training_config.get("early_stopping", {})
+    early_stopping_enabled = bool(early_stopping.get("enabled", False))
+    early_stopping_patience = int(early_stopping.get("patience", 12))
+    early_stopping_min_delta = float(early_stopping.get("min_delta", 0.0))
+    early_stopping_monitor = str(
+        early_stopping.get("monitor", "val_rain_rmse")
+    ).lower()
+    if early_stopping_enabled and early_stopping_patience <= 0:
+        raise ValueError("early-stopping patience must be positive")
+    if early_stopping_min_delta < 0 or not math.isfinite(early_stopping_min_delta):
+        raise ValueError("early-stopping min_delta must be finite and non-negative")
+    if early_stopping_monitor != "val_rain_rmse":
+        raise ValueError("only early-stopping monitor 'val_rain_rmse' is supported")
+    early_stopping_bad_epochs = 0
     if args.resume is not None:
         checkpoint = load_checkpoint(
             args.resume,
@@ -429,6 +509,9 @@ def main() -> None:
         global_step = int(checkpoint["global_step"])
         previous = checkpoint.get("metrics") or {}
         best_rmse = float(previous.get("best_rain_rmse", math.inf))
+        early_stopping_bad_epochs = int(
+            previous.get("early_stopping_bad_epochs", 0)
+        )
 
     max_batches = 2 if args.smoke_test else config["evaluation"]["max_batches"]
     training_completed = False
@@ -457,14 +540,25 @@ def main() -> None:
                 use_amp=amp_enabled,
                 thresholds_mm_h=thresholds,
                 max_batches=max_batches,
+                stratified_metrics=stratified_metrics,
             )
             if scheduler is not None and train_result.optimizer_steps > 0:
                 scheduler.step()
             global_step += train_result.optimizer_steps
             val_rmse = float(val_result.metrics["rain"]["all"]["rmse"])
-            improved = math.isfinite(val_rmse) and val_rmse < best_rmse
+            improved = (
+                math.isfinite(val_rmse)
+                and val_rmse < best_rmse - early_stopping_min_delta
+            )
             if improved:
                 best_rmse = val_rmse
+                early_stopping_bad_epochs = 0
+            else:
+                early_stopping_bad_epochs += 1
+            should_stop = (
+                early_stopping_enabled
+                and early_stopping_bad_epochs >= early_stopping_patience
+            )
 
             if is_main:
                 record = {
@@ -475,6 +569,8 @@ def main() -> None:
                     "train": train_result.to_dict(),
                     "val": val_result.to_dict(),
                     "best_rain_rmse": best_rmse,
+                    "early_stopping_bad_epochs": early_stopping_bad_epochs,
+                    "early_stopping_triggered": should_stop,
                 }
                 safe_record = _json_safe(record)
                 print(json.dumps(safe_record, ensure_ascii=False), flush=True)
@@ -482,6 +578,7 @@ def main() -> None:
                     handle.write(json.dumps(safe_record, ensure_ascii=False) + "\n")
                 checkpoint_metrics = {
                     "best_rain_rmse": best_rmse,
+                    "early_stopping_bad_epochs": early_stopping_bad_epochs,
                     "train": train_result.to_dict(),
                     "val": val_result.to_dict(),
                 }
@@ -525,6 +622,16 @@ def main() -> None:
                 distributed.barrier(
                     device_ids=[device.index] if device.type == "cuda" else None
                 )
+            if should_stop:
+                if is_main:
+                    print(
+                        "[early-stopping] no validation rain-RMSE improvement "
+                        f"greater than {early_stopping_min_delta:g} for "
+                        f"{early_stopping_bad_epochs} epochs; stopping at epoch "
+                        f"{epoch} (best={best_rmse:.6f} mm/h).",
+                        flush=True,
+                    )
+                break
         training_completed = True
     finally:
         if distributed.is_available() and distributed.is_initialized():
@@ -540,6 +647,13 @@ def main() -> None:
             run_postprocessing(output_dir, config, skip=args.skip_postprocessing)
         except Exception as error:
             print(f"[postprocessing] ERROR: {error}", file=sys.stderr, flush=True)
+            failure = output_dir / "analysis" / "POSTPROCESSING_FAILED.txt"
+            failure.parent.mkdir(parents=True, exist_ok=True)
+            failure.write_text(
+                "训练已经完成，但自动分析失败。请检查训练日志并手动重跑。\n"
+                f"错误：{type(error).__name__}: {error}\n",
+                encoding="utf-8",
+            )
             if bool(config.get("postprocessing", {}).get("fail_on_error", False)):
                 raise
 

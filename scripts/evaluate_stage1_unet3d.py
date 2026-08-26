@@ -20,13 +20,19 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from precipitation_inversion.data.nc_reader import read_nc_sample  # noqa: E402
-from precipitation_inversion.data.patch_dataset import Stage1PatchDataset  # noqa: E402
+from precipitation_inversion.data.patch_dataset import (  # noqa: E402
+    Stage1PatchDataset,
+    stage1_patch_dataset_kwargs,
+)
 from precipitation_inversion.inference.sliding_window import (  # noqa: E402
     predict_full_orbit,
 )
 from precipitation_inversion.losses.masked_losses import MaskedSmoothL1Loss  # noqa: E402
 from precipitation_inversion.metrics.regression import (  # noqa: E402
+    FilewisePrecipitationMetrics,
+    PhysicalRainGradientMetrics,
     PrecipitationRegressionMetrics,
+    StratifiedPrecipitationMetrics,
 )
 from precipitation_inversion.models.unet3d import Stage1UNet3D  # noqa: E402
 from precipitation_inversion.training.engine import (  # noqa: E402
@@ -42,12 +48,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-batches", type=int)
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        help="Override data.num_workers (use 0 for restricted/CPU diagnostics).",
+    )
+    parser.add_argument(
+        "--stratified",
+        action="store_true",
+        help="Force absolute-height/CFB/intensity/type diagnostics.",
+    )
+    parser.add_argument(
+        "--no-physical-drdz",
+        action="store_true",
+        help="Disable the default physical vertical rain-gradient diagnostic.",
+    )
+    parser.add_argument(
         "--full-orbits",
         type=int,
         help="Also reconstruct and evaluate the first N complete source orbits.",
     )
     parser.add_argument("--orbit-output-dir", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=2026,
+        help="Reproducible whole-file bootstrap seed (default: 2026).",
+    )
+    parser.add_argument(
+        "--bootstrap-replicates",
+        type=int,
+        default=2000,
+        help="Number of whole-file bootstrap resamples (default: 2000).",
+    )
+    parser.add_argument(
+        "--bootstrap-confidence",
+        type=float,
+        default=0.95,
+        help="Two-sided macro-metric confidence level (default: 0.95).",
+    )
     return parser.parse_args()
 
 
@@ -102,6 +141,71 @@ def resolve_device(value: str) -> torch.device:
     return device
 
 
+def build_stratified_metrics(
+    config: Mapping[str, Any], heights_km: np.ndarray, *, force: bool = False
+) -> StratifiedPrecipitationMetrics | None:
+    """Build optional full-support diagnostics from evaluation configuration."""
+
+    values = config.get("evaluation", {}).get("stratified", {})
+    if not force and not bool(values.get("enabled", False)):
+        return None
+    thresholds = tuple(float(value) for value in config["loss"]["thresholds_mm_h"])
+    options = {
+        "cfb_distance_edges_km": tuple(
+            float(value)
+            for value in values.get(
+                "cfb_distance_edges_km", (-1.0, 0.0, 0.5, 2.0)
+            )
+        ),
+        "intensity_thresholds_mm_h": thresholds,
+    }
+    height_edges = values.get("height_bin_edges_km")
+    if height_edges is None:
+        return StratifiedPrecipitationMetrics(
+            np.asarray(heights_km, dtype=float).tolist(), **options
+        )
+    return StratifiedPrecipitationMetrics(
+        height_bin_edges_km=tuple(float(value) for value in height_edges),
+        **options,
+    )
+
+
+def build_physical_gradient_metrics(
+    config: Mapping[str, Any],
+    heights_km: np.ndarray,
+    *,
+    file_labels: list[str] | None = None,
+    disabled: bool = False,
+    bootstrap_seed: int = 2026,
+    bootstrap_replicates: int = 2000,
+    confidence_level: float = 0.95,
+) -> PhysicalRainGradientMetrics | None:
+    """Build the shared physical dR/dz implementation used by every model."""
+
+    values = config.get("evaluation", {}).get("physical_drdz", {})
+    if disabled or not bool(values.get("enabled", True)):
+        return None
+    stratified = config.get("evaluation", {}).get("stratified", {})
+    cfb_edges = values.get(
+        "cfb_distance_edges_km",
+        stratified.get("cfb_distance_edges_km", (-1.0, 0.0, 0.5, 2.0)),
+    )
+    return PhysicalRainGradientMetrics(
+        np.asarray(heights_km, dtype=float).tolist(),
+        cfb_distance_edges_km=tuple(float(value) for value in cfb_edges),
+        intensity_thresholds_mm_h=tuple(
+            float(value) for value in config["loss"]["thresholds_mm_h"]
+        ),
+        sign_epsilon_mm_h_km=float(
+            values.get("sign_epsilon_mm_h_km", 0.1)
+        ),
+        file_labels=file_labels,
+        bootstrap_seed=bootstrap_seed,
+        bootstrap_replicates=bootstrap_replicates,
+        confidence_level=confidence_level,
+    )
+
+
 def main() -> None:
     args = parse_args()
     checkpoint_path = args.checkpoint.expanduser().resolve()
@@ -121,14 +225,32 @@ def main() -> None:
     model.eval()
 
     data_config = config["data"]
+    loss_config = config["loss"]
+    dataset_options = stage1_patch_dataset_kwargs(data_config, loss_config)
     index_key = f"{args.split}_index"
     dataset = Stage1PatchDataset(
         project_path(data_config[index_key]),
         project_path(data_config["normalization"]),
-        positive_only=True,
+        # Complete split coverage is required for below-CFB native-positive
+        # diagnostics and file-macro statistics. Primary reliable metrics keep
+        # their historical positive mask, so adding dry/below-only patches does
+        # not change model selection support.
+        positive_only=False,
         cache_size=int(data_config["cache_size"]),
+        **dataset_options,
     )
-    workers = int(data_config["num_workers"])
+    if len(dataset.feature_names) != int(config["model"]["in_channels"]):
+        raise ValueError(
+            "checkpoint model input channels do not match Dataset features: "
+            f"{config['model']['in_channels']} != {dataset.feature_names}"
+        )
+    workers = (
+        int(data_config["num_workers"])
+        if args.num_workers is None
+        else args.num_workers
+    )
+    if workers < 0:
+        raise ValueError("num-workers must be non-negative")
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=int(data_config["batch_size"]),
@@ -137,10 +259,25 @@ def main() -> None:
         pin_memory=bool(data_config["pin_memory"]),
         persistent_workers=bool(data_config["persistent_workers"]) and workers > 0,
     )
-    loss_config = config["loss"]
     criterion = MaskedSmoothL1Loss(beta=float(loss_config["beta"]))
     thresholds = tuple(float(value) for value in loss_config["thresholds_mm_h"])
     amp_enabled = bool(config["training"]["amp"]) and device.type == "cuda"
+    filewise_metrics = FilewisePrecipitationMetrics(
+        [str(entry["sample_id"]) for entry in dataset.source_files],
+        bootstrap_seed=args.bootstrap_seed,
+        bootstrap_replicates=args.bootstrap_replicates,
+        confidence_level=args.bootstrap_confidence,
+    )
+    file_labels = [str(entry["sample_id"]) for entry in dataset.source_files]
+    physical_gradient_metrics = build_physical_gradient_metrics(
+        config,
+        dataset.z,
+        file_labels=file_labels,
+        disabled=args.no_physical_drdz,
+        bootstrap_seed=args.bootstrap_seed,
+        bootstrap_replicates=args.bootstrap_replicates,
+        confidence_level=args.bootstrap_confidence,
+    )
     patch_result = evaluate_one_epoch(
         model,
         loader,
@@ -149,12 +286,24 @@ def main() -> None:
         use_amp=amp_enabled,
         thresholds_mm_h=thresholds,
         max_batches=args.max_batches,
+        stratified_metrics=build_stratified_metrics(
+            config, dataset.z, force=args.stratified
+        ),
+        filewise_metrics=filewise_metrics,
+        physical_gradient_metrics=physical_gradient_metrics,
     )
     result: dict[str, Any] = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "split": args.split,
-        "patch_evaluation": patch_result.to_dict(),
+        "patch_evaluation": {
+            **patch_result.to_dict(),
+            "coverage": {
+                "complete_patch_support": args.max_batches is None,
+                "max_batches": args.max_batches,
+                "sampling_unit": "unique non-overlapping output-core patch",
+            },
+        },
     }
 
     configured_orbits = int(config["evaluation"].get("save_orbits", 0))
@@ -169,8 +318,12 @@ def main() -> None:
             project_path(data_config["normalization"]),
             positive_only=False,
             cache_size=int(data_config["cache_size"]),
+            **dataset_options,
         )
         full_metrics = PrecipitationRegressionMetrics(thresholds)
+        full_stratified = build_stratified_metrics(
+            config, full_dataset.z, force=args.stratified
+        )
         orbit_directory = project_path(
             args.orbit_output_dir
             if args.orbit_output_dir is not None
@@ -178,6 +331,18 @@ def main() -> None:
         )
         orbit_directory.mkdir(parents=True, exist_ok=True)
         processed = min(full_orbit_count, len(full_dataset.source_files))
+        full_gradient_metrics = build_physical_gradient_metrics(
+            config,
+            full_dataset.z,
+            file_labels=[
+                str(full_dataset.source_files[index]["sample_id"])
+                for index in range(processed)
+            ],
+            disabled=args.no_physical_drdz,
+            bootstrap_seed=args.bootstrap_seed,
+            bootstrap_replicates=args.bootstrap_replicates,
+            confidence_level=args.bootstrap_confidence,
+        )
         for file_id in range(processed):
             # Each patch output=(1,64,64,60); core cropping reconstructs
             # prediction_rain=(source_nscan,49,60) in physical mm/h.
@@ -193,13 +358,54 @@ def main() -> None:
             entry = full_dataset.source_files[file_id]
             sample = read_nc_sample(
                 entry["file_path"],
-                variables=("z", "pre_dpr", "cfb"),
+                variables=("z", "dbz_dpr", "pre_dpr", "cfb", "typePrecip"),
                 dtype=np.float32,
                 build_masks=True,
             )
             target_rain = sample.variables["pre_dpr"]
-            positive_mask = sample.masks["pre_positive_qc"]
+            positive_mask = (
+                sample.masks["pre_positive_qc"]
+                & sample.masks["dpr_reflectivity_valid"]
+            )
             full_metrics.update_rain(prediction_rain, target_rain, positive_mask)
+            z = sample.variables["z"]
+            cfb = sample.variables["cfb"]
+            # Do not cast NaN/missing CFB values directly to integers: NumPy
+            # would create a meaningless sentinel. Invalid profiles use 0 only
+            # for safe indexing and are masked out again after broadcasting.
+            finite_cfb = np.isfinite(cfb)
+            cfb_index = np.where(finite_cfb, cfb, 0.0).astype(np.int64)
+            valid_cfb = (
+                finite_cfb
+                & (cfb == cfb_index)
+                & (cfb_index >= 0)
+                & (cfb_index < z.size)
+            )
+            safe_index = np.where(valid_cfb, cfb_index, 0)
+            boundary = z[safe_index]
+            cfb_distance = z.reshape(1, 1, -1) - boundary[..., np.newaxis]
+            cfb_distance = np.where(
+                valid_cfb[..., np.newaxis], cfb_distance, np.nan
+            )
+            if full_gradient_metrics is not None:
+                full_gradient_metrics.update_rain(
+                    prediction_rain,
+                    target_rain,
+                    positive_mask,
+                    height_km=z,
+                    cfb_distance_km=cfb_distance,
+                    precipitation_type=sample.variables["typePrecip"],
+                    file_id=file_id,
+                )
+            if full_stratified is not None:
+                full_stratified.update_rain(
+                    prediction_rain,
+                    target_rain,
+                    positive_mask,
+                    height_km=z,
+                    cfb_distance_km=cfb_distance,
+                    precipitation_type=sample.variables["typePrecip"],
+                )
             np.savez_compressed(
                 orbit_directory / f"{entry['sample_id']}.npz",
                 prediction_rain_mm_h=prediction_rain.astype(np.float32),
@@ -211,6 +417,14 @@ def main() -> None:
             "metrics": full_metrics.compute(),
             "output_dir": str(orbit_directory),
         }
+        if full_stratified is not None:
+            result["full_orbit_evaluation"]["metrics"][
+                "stratified"
+            ] = full_stratified.compute()
+        if full_gradient_metrics is not None:
+            result["full_orbit_evaluation"]["metrics"][
+                "physical_drdz"
+            ] = full_gradient_metrics.compute()
 
     safe_result = json_safe(result)
     output_path = (

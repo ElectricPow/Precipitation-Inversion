@@ -45,6 +45,12 @@ from .dataset import (
 )
 from .samplers import FileBlockBatchSampler, FileIndexRange, file_ranges_from_dataset
 from .patch_dataset import (
+    CFB_DISTANCE_INPUT_CHANNEL,
+    CFB_INPUT_MODES,
+    CFB_QUALITY_CLUTTER,
+    CFB_QUALITY_RELIABLE,
+    CFB_QUALITY_UNKNOWN,
+    CFB_QUALITY_WEAK,
     PATCH_INDEX_DTYPE,
     PATCH_INDEX_FORMAT_VERSION,
     PATCH_INPUT_CHANNELS,
@@ -52,6 +58,7 @@ from .patch_dataset import (
     build_stage1_patch_index_records,
     ceil_to_multiple,
     core_starts,
+    stage1_patch_dataset_kwargs,
 )
 
 __all__ = [
@@ -91,6 +98,12 @@ __all__ = [
     "FileBlockBatchSampler",
     "FileIndexRange",
     "file_ranges_from_dataset",
+    "CFB_DISTANCE_INPUT_CHANNEL",
+    "CFB_INPUT_MODES",
+    "CFB_QUALITY_CLUTTER",
+    "CFB_QUALITY_RELIABLE",
+    "CFB_QUALITY_UNKNOWN",
+    "CFB_QUALITY_WEAK",
     "PATCH_INDEX_DTYPE",
     "PATCH_INDEX_FORMAT_VERSION",
     "PATCH_INPUT_CHANNELS",
@@ -98,4 +111,5 @@ __all__ = [
     "build_stage1_patch_index_records",
     "ceil_to_multiple",
     "core_starts",
+    "stage1_patch_dataset_kwargs",
 ]

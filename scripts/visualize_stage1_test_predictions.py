@@ -26,7 +26,10 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from precipitation_inversion.data.nc_reader import read_nc_sample  # noqa: E402
-from precipitation_inversion.data.patch_dataset import Stage1PatchDataset  # noqa: E402
+from precipitation_inversion.data.patch_dataset import (  # noqa: E402
+    Stage1PatchDataset,
+    stage1_patch_dataset_kwargs,
+)
 from precipitation_inversion.inference.sliding_window import predict_full_orbit  # noqa: E402
 from precipitation_inversion.metrics.regression import PrecipitationRegressionMetrics  # noqa: E402
 from precipitation_inversion.models.unet3d import Stage1UNet3D  # noqa: E402
@@ -423,12 +426,19 @@ def generate_prediction_analysis(
     model.load_state_dict(checkpoint["model"])
     model.eval()
     data_config = config["data"]
+    dataset_options = stage1_patch_dataset_kwargs(data_config, config["loss"])
     dataset = Stage1PatchDataset(
         project_path(data_config["test_index"]),
         project_path(data_config["normalization"]),
         positive_only=False,
         cache_size=int(data_config["cache_size"]),
+        **dataset_options,
     )
+    if len(dataset.feature_names) != int(config["model"]["in_channels"]):
+        raise ValueError(
+            "checkpoint model input channels do not match Dataset features: "
+            f"{config['model']['in_channels']} != {dataset.feature_names}"
+        )
     eligible_ids = [
         file_id
         for file_id, entry in enumerate(dataset.source_files)

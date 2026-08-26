@@ -1,5 +1,21 @@
 """Evaluation metrics for precipitation inversion."""
 
-from .regression import PrecipitationRegressionMetrics, RegressionAccumulator
+from .regression import (
+    FilewisePrecipitationMetrics,
+    GroupedRegressionAccumulator,
+    PhysicalRainGradientMetrics,
+    PrecipitationRegressionMetrics,
+    RegressionAccumulator,
+    StratifiedPrecipitationMetrics,
+    physical_vertical_rain_gradient,
+)
 
-__all__ = ["PrecipitationRegressionMetrics", "RegressionAccumulator"]
+__all__ = [
+    "FilewisePrecipitationMetrics",
+    "GroupedRegressionAccumulator",
+    "PhysicalRainGradientMetrics",
+    "PrecipitationRegressionMetrics",
+    "RegressionAccumulator",
+    "StratifiedPrecipitationMetrics",
+    "physical_vertical_rain_gradient",
+]

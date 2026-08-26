@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from precipitation_inversion.losses.masked_losses import (  # noqa: E402
     MaskedSmoothL1Loss,
+)
+from precipitation_inversion.metrics.regression import (  # noqa: E402
+    FilewisePrecipitationMetrics,
+    PhysicalRainGradientMetrics,
 )
 from precipitation_inversion.training.engine import (  # noqa: E402
     evaluate_one_epoch,
@@ -43,7 +48,54 @@ class TinyPatchDataset(torch.utils.data.Dataset):
         target[:, 1:3, 1:3, :] = 0.5 * (index + 1)
         mask = torch.zeros_like(target, dtype=torch.bool)
         mask[:, 1:3, 1:3, :] = True
-        return {"inputs": inputs, "target": target, "loss_mask": mask}
+        return {
+            "inputs": inputs,
+            "target": target,
+            "loss_mask": mask,
+            "file_id": torch.tensor(index, dtype=torch.int64),
+            "height_km": torch.tensor([0.0, 0.5, 1.5]).reshape(1, 1, 1, 3),
+            "precipitation_type": torch.ones(4, 4),
+        }
+
+
+class WeightedTinyDataset(torch.utils.data.Dataset):
+    """One batch containing reliable and weak-CFB supervision."""
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        inputs = torch.zeros(3, 1, 1, 2, dtype=torch.float32)
+        target = torch.tensor([[[[0.5, 1.0]]]], dtype=torch.float32)
+        loss_mask = torch.ones_like(target, dtype=torch.bool)
+        reliable = torch.tensor([[[[True, False]]]])
+        weights = torch.tensor([[[[1.0, 0.1]]]], dtype=torch.float32)
+        return {
+            "inputs": inputs,
+            "target": target,
+            "loss_mask": loss_mask,
+            "reliable_loss_mask": reliable,
+            "loss_weights": weights,
+            # The second voxel is a native-positive target one level below CFB.
+            # These fields are evaluation diagnostics and do not change loss.
+            "diagnostic_target": target.clone(),
+            "native_positive_mask": torch.tensor([[[[False, True]]]]),
+            "cfb_distance_km": torch.tensor([[[[0.0, -0.25]]]]),
+            "height_km": torch.tensor([0.0, 0.25]).reshape(1, 1, 1, 2),
+            "precipitation_type": torch.ones(1, 1),
+            "file_id": torch.tensor(0, dtype=torch.int64),
+        }
+
+
+class DDPStyleWrapper(torch.nn.Module):
+    """Expose ``module`` like DDP and fail if its wrapper forward is used."""
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        raise AssertionError("evaluation must bypass the DDP-style wrapper")
 
 
 class TrainingEngineTests(unittest.TestCase):
@@ -92,6 +144,104 @@ class TrainingEngineTests(unittest.TestCase):
         self.assertTrue(self.model.training)
         for old, new in zip(before, self.model.parameters()):
             torch.testing.assert_close(old, new)
+
+    def test_evaluation_uses_unwrapped_module_for_uneven_ddp_shards(self) -> None:
+        wrapped = DDPStyleWrapper(torch.nn.Conv3d(3, 1, kernel_size=1))
+        wrapped.train()
+        result = evaluate_one_epoch(
+            wrapped,
+            self.loader,
+            self.criterion,
+            "cpu",
+            use_amp=False,
+            max_batches=1,
+        )
+        self.assertEqual(result.batch_count, 1)
+        self.assertTrue(wrapped.training)
+
+    def test_weighted_loss_keeps_primary_metrics_on_reliable_mask(self) -> None:
+        model = torch.nn.Conv3d(3, 1, kernel_size=1)
+        with torch.no_grad():
+            model.weight.zero_()
+            model.bias.zero_()
+        loader = torch.utils.data.DataLoader(WeightedTinyDataset(), batch_size=1)
+        result = evaluate_one_epoch(
+            model, loader, self.criterion, "cpu", use_amp=False
+        )
+        batch = next(iter(loader))
+        expected = self.criterion(
+            model(batch["inputs"]),
+            batch["target"],
+            batch["loss_mask"],
+            batch["loss_weights"],
+        )
+        self.assertAlmostEqual(result.loss, float(expected.detach()), places=7)
+        self.assertEqual(result.valid_voxels, 2)  # reliable + weak loss locations
+        self.assertEqual(result.metrics["rain"]["all"]["count"], 1)
+        below = result.metrics["diagnostics"]["below_cfb_native_positive"]
+        self.assertEqual(below["rain"]["all"]["count"], 1)
+        self.assertAlmostEqual(
+            below["rain"]["all"]["bias"], -math.expm1(1.0), places=6
+        )
+
+    def test_filewise_macro_metrics_are_optional_and_use_file_ids(self) -> None:
+        filewise = FilewisePrecipitationMetrics(
+            ("first", "second", "third"), bootstrap_replicates=25
+        )
+        result = evaluate_one_epoch(
+            self.model,
+            self.loader,
+            self.criterion,
+            "cpu",
+            use_amp=False,
+            max_batches=2,
+            filewise_metrics=filewise,
+        )
+        values = result.metrics["filewise"]
+        self.assertEqual(values["file_count_nonempty"], 2)
+        self.assertEqual(values["valid_voxel_count"], 24)
+        self.assertEqual(values["per_file"]["first"]["count"], 12)
+        self.assertEqual(values["per_file"]["second"]["count"], 12)
+        self.assertEqual(values["per_file"]["third"]["count"], 0)
+
+    def test_physical_drdz_metrics_use_reliable_adjacent_pairs(self) -> None:
+        gradients = PhysicalRainGradientMetrics(
+            (0.0, 0.5, 1.5),
+            file_labels=("first", "second", "third"),
+            bootstrap_replicates=25,
+        )
+        result = evaluate_one_epoch(
+            self.model,
+            self.loader,
+            self.criterion,
+            "cpu",
+            use_amp=False,
+            max_batches=2,
+            physical_gradient_metrics=gradients,
+        )
+        values = result.metrics["physical_drdz"]
+        # Each sample has four selected horizontal profiles and two adjacent
+        # vertical pairs: 2 batches * 4 profiles * 2 pairs = 16.
+        self.assertEqual(values["all"]["count"], 16)
+        self.assertEqual(values["filewise"]["valid_voxel_count"], 16)
+
+        weak_loader = torch.utils.data.DataLoader(
+            WeightedTinyDataset(), batch_size=1
+        )
+        weak_gradients = PhysicalRainGradientMetrics((0.0, 0.25))
+        weak_result = evaluate_one_epoch(
+            torch.nn.Conv3d(3, 1, kernel_size=1),
+            weak_loader,
+            self.criterion,
+            "cpu",
+            use_amp=False,
+            physical_gradient_metrics=weak_gradients,
+        )
+        # The total loss mask has two endpoints, but only the first is reliable;
+        # W's weak below-CFB endpoint must therefore not create a primary pair.
+        self.assertEqual(
+            weak_result.metrics["physical_drdz"]["all"]["count"], 0
+        )
 
     def test_checkpoint_round_trip_restores_model_optimizer_and_metadata(self) -> None:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-2)

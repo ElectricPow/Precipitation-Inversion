@@ -1,6 +1,6 @@
 # Precipitation Inversion
 
-基于地基雷达（Ground Radar, GR）稀疏三维反射率反演稠密三维降水率的研究项目。本仓库当前处于数据理解、基线代码梳理与可视化验证阶段，目标是为后续毕业设计中的模型构建和实验评估建立可靠的数据基础。
+基于地基雷达（Ground Radar, GR）稀疏三维反射率反演稠密三维降水率的研究项目。截至2026-08-26，仓库已完成数据审计、无泄漏划分、三维Patch数据管线、高度保持3D U-Net、多卡训练与完整验证，并完成阶段一E0/E1/E2及E0-N/I/W两轮消融。当前已加入统一的物理垂直降水率梯度`dR/dz`评价，用于判断模型是否保留降水廓线的垂直结构。
 
 ## 1. 研究任务
 
@@ -20,6 +20,14 @@ GR 稀疏三维反射率 + 观测掩码 + 可用气象背景场
 - 质量控制信息：`cfb`、`binRealSurface`、`flagPrecip` 等。
 
 `pre_dpr` 是卫星遥感反演产品，并非无误差的物理真值，因此本文称其为参考标签或伪真值。
+
+最终任务拆为三个阶段：
+
+1. `dbz_dpr → pre_dpr`：先学习卫星DPR反射率到卫星降水率的条件强度映射；
+2. `dbz_gr_sparse → DPR反射率域`：再学习地基雷达稀疏反射率到DPR反射率域的分布映射；
+3. 串联两阶段模型，并按消融结果决定是否加入气象背景场等辅助变量。
+
+当前已经训练的是阶段一。因此本轮模型输入是卫星变量`dbz_dpr`，不是最终部署阶段的`dbz_gr_sparse`；这样可以先把“反射率到降水率”的难点与跨雷达域转换分开验证。
 
 师兄此前采用的主要路线是：
 
@@ -80,7 +88,7 @@ GR 稀疏三维反射率 + 观测掩码 + 可用气象背景场
 
 更完整的物理解释见[数据集说明](./数据集说明.md)，所有变量、属性、统计量和代表值见[单样本变量与数值分析](./NC样本变量与数值分析.md)。
 
-## 3. 本周研究进度（2026-08-17—2026-08-23）
+## 3. 阶段研究进度（截至2026-08-26）
 
 ### 3.1 完成数据定位和资料梳理
 
@@ -185,6 +193,97 @@ dbz_dpr                   | pre_dpr
 4. 强降水占比极低，应关注条件误差、阈值命中率和对流样本表现；
 5. 在研究新模型前，需要先建立统一、可复现的传统 Z–R 和插值基线。
 
+### 3.6 完成阶段一高度保持3D U-Net首轮训练
+
+阶段一把每条长度不同的轨道切成“非重叠32扫描线输出核心 + 左右各16扫描线上下文”的窗口。原始窗口`(64,49,60)`只在横轨方向补到64，形成模型批次`(B,C,64,64,60)`；高度60层始终不裁剪、不补齐，也不在U-Net中下采样。模型只沿扫描和横轨方向用`(2,2,1)`缩放，最后输出`(B,1,64,64,60)`，评价时只保留中心核心和真实49条横轨波束。
+
+首轮三组实验除下表所列输入区别外，使用相同的数据划分、随机种子、网络、优化器和训练策略：
+
+| 实验 | 输入通道及形状 | CFB处理 | 主损失 |
+|---|---|---|---|
+| E0 baseline | `dbz_dpr标准化值 + 有效性mask + 高度`，`(B,3,64,64,60)` | 保留CFB以下有效DPR反射率 | `pre_positive_qc`内的`log1p` masked Smooth L1，`beta=0.2` |
+| E1 mask CFB | 同E0，`(B,3,64,64,60)` | CFB以下输入置为`dbz=0, valid=0` | 与E0完全相同 |
+| E2 CFB distance | E0三通道 + 裁剪后的有符号CFB距离，`(B,4,64,64,60)` | 距离定义为`clip((z-z_cfb)/2 km,-1,1)` | 与E0完全相同 |
+
+三组实验的主监督和模型选择口径没有变化：仅在同时满足DPR反射率有效、`pre_dpr>0`、且位于CFB及其上方的`pre_positive_qc`体素上训练和验证。标签先做`log1p(R)`，损失只在mask内归约；MAE、RMSE、Bias、R²和Pearson相关系数再变回`mm/h`空间计算。因此首轮是“可靠正降水条件下的强度回归”，尚不是含无降水识别的全空间降水检测任务。
+
+### 3.7 E0/E1/E2完整验证结果与分析
+
+以下结果来自各实验`best.pt`在同一完整验证集上的299个Patch、1,195,966个可靠正降水体素；没有用6条固定测试轨道选择模型。
+
+| 实验 | best epoch | MAE (mm/h) | RMSE (mm/h) | Bias (mm/h) | R² | Pearson r |
+|---|---:|---:|---:|---:|---:|---:|
+| E0 | 31 | 0.489750875 | **2.347860068** | -0.094303728 | **0.717183289** | **0.848496524** |
+| E1 | 42 | 0.504331201 | 2.478820312 | -0.103190132 | 0.684753161 | 0.831565221 |
+| E2 | 34 | 0.489888098 | 2.405469622 | -0.097537388 | 0.703134040 | 0.842449410 |
+
+完整验证集总体上E1和E2都弱于E0：E1 RMSE比E0高约5.58%，E2高约2.45%。分层结果进一步说明误差主要来自低层和极端长尾：
+
+- 0–2 km RMSE分别为E0 `4.9414`、E1 `5.3481`、E2 `5.1676 mm/h`；屏蔽CFB以下输入没有改善低层边界，反而进一步损伤上下文。
+- `>=30 mm/h`仅有4,624个体素，约占验证支持的0.39%，却贡献E0总平方误差的68.16%；其E0 RMSE为`31.173 mm/h`、Bias为`-16.429 mm/h`，强降水低估是下一轮损失设计的首要目标。
+- E2在部分高层以及`5–30 mm/h`中强雨分箱优于E0。6条固定测试轨道上E2也优于E0（RMSE `1.57768`对`1.63468 mm/h`，r `0.91748`对`0.90823`），但样本太少且属于测试集，不能据此调参或覆盖完整验证结论。
+
+E1从训练输入额外删除了1,036,674个有效DPR反射率体素，约占15.90%。被删除值统一编码为`dbz=0, valid=0`，使“CFB以下低置信回波”和“传感器真正缺测”在模型输入中无法区分。因此E1实际检验的是删除低层上下文，而没有检验低置信数据能否作为弱证据使用。
+
+E2也不能简单解释为“第四通道稀释了前三通道”。它只给网络增加160个参数，约占总参数的0.008%，不是容量上的显著改变；更可能的问题是该通道在空间中稠密、绝对尺度较大、大量值裁剪饱和，并与已有高度通道高度共线，容易在优化早期形成捷径。E2仍保留了局部收益，因此暂不否定CFB几何信息，但下一轮不直接以该四通道方案为主线。
+
+仓库保留了早期拟定的E3/E4配置（从E1或E2继续叠加逆频率高度权重、较强强度权重和/或弱CFB监督），但它们没有正式训练。由于其父实验E1/E2总体已退化，而且E3/E4一次改变多个因素，当前不再优先启动，改用下述从E0逐项增加因素的E0-N系列。
+
+### 3.8 第二轮E0-N/I/W实验
+
+为避免同时改变过多因素，第二轮全部从E0三通道结构出发，并使用同一网络、划分、种子和训练配置：
+
+| 实验 | 相对E0的唯一或组合改动 | 输入形状 | 训练损失变化 | 状态 |
+|---|---|---:|---|---|
+| E0-N | 只更换`dbz_dpr`输入归一化统计 | `(B,3,64,64,60)` | 无 | 已完成，best epoch 38 |
+| E0-N-I | E0-N + 按真实降水强度加权 | `(B,3,64,64,60)` | `<1/1–5/5–10/10–30/>=30 mm/h`权重为`1/1/1.5/2/3` | 已完成，best epoch 32 |
+| E0-N-W | E0-N + CFB下方原生正降水弱监督 | `(B,3,64,64,60)` | CFB下第1/2层权重为`0.1/0.05` | 已完成，best epoch 35 |
+| E0-N-IW | E0-N同时加入I和W | `(B,3,64,64,60)` | 强度权重与弱CFB权重相乘 | 条件待测 |
+
+旧文件`stage1_positive_qc.json`在拟合输入统计时使用了标签QC条件，导致0.125和0.375 km两层无样本，标准化器也会把这两层的原生有效DPR输入当作无效值。新文件`stage1_dbz_valid.json`把输入与标签口径完全解耦：
+
+- 输入归一化只使用175个训练文件中`dbz_dpr`自身全部有限、非fill值，共6,822,356个，60个高度层都有统计；最低两层分别有131,972和172,153个值；
+- 标签、可靠主损失和主评价仍使用`pre_positive_qc`，共5,481,557个训练体素；
+- 标签QC不再反向决定输入统计，但不会扩大可靠标签范围；E0-N的输入仍是三通道`(B,3,64,64,60)`。
+
+I和W都通过`loss_weights`作用于同一个masked Smooth L1加权平均，归一化分母是当前local batch内被选体素的权重和。正式配置每卡batch为1，所以语义仍是“每Patch先归一、DDP再等权平均各rank梯度”，不是跨GPU使用一个全局体素分母。W只选择CFB下方第1、2个高度层中同时具有原生正`pre_dpr`和原生有效DPR回波的体素；它们不会并入`reliable_loss_mask`。W/IW在整轨推理中的近CFB `output_mask` 只由核心几何、原生DPR有效性、有效CFB和配置层数决定，不查看真实降水标签。完整验证、`best.pt`选择及各实验主表仍只看可靠mask，CFB以下原生正降水另列为诊断，避免通过改变评价口径制造“提升”。
+
+注意：W实验日志的`valid_voxels`包含弱监督，而`metrics.rain.all.count`只包含可靠体素；加权后的loss数值也不能与E0的未加权loss直接比大小，应比较同一可靠mask上的MAE/RMSE/Bias/R²/r。
+
+验证流程也已修正：DDP训练仍使用各rank等步数的`even_batches=True`，而验证使用互不重复且允许不等长的分片，并通过已同步模型的裸模块前向，因此299个验证Patch既不丢失也不补重复。评估器新增CFB以下原生正降水独立诊断、逐文件/轨道宏平均，以及以完整轨道为抽样单位、固定种子的bootstrap置信区间；这些结果均与主可靠指标分开保存。
+
+四个可直接比较的模型在同一完整验证集、1,195,966个可靠正降水体素上的结果如下。N仅改变输入归一化后RMSE轻微退化；I明显改善RMSE、R²和相关性；W与E0总体接近，不能证明CFB下弱监督带来稳定收益。
+
+| 实验 | MAE (mm/h) | RMSE (mm/h) | Bias (mm/h) | R² | Pearson r |
+|---|---:|---:|---:|---:|---:|
+| E0 | **0.489751** | 2.347860 | -0.094304 | 0.717183 | 0.848497 |
+| E0-N | 0.489903 | 2.363538 | -0.107568 | 0.713394 | 0.851559 |
+| E0-N-I | 0.495106 | **2.129368** | **+0.000455** | **0.767372** | **0.876012** |
+| E0-N-W | 0.497695 | 2.349883 | -0.053538 | 0.716696 | 0.848683 |
+
+### 3.9 物理垂直梯度dR/dz评价
+
+统一实现先把模型的`log1p`输出还原为非负物理降水率`R (mm/h)`，再在原生高度坐标上计算相邻层向上差分：
+
+\[
+\frac{dR}{dz}\bigg|_{k+1/2}=\frac{R_{k+1}-R_k}{z_{k+1}-z_k}
+\]
+
+输入60层降水率得到59层梯度，单位为`mm h^-1 km^-1`。只有相邻两个端点都属于可靠主评价mask时才计入，因而不会跨缺测、padding或W的CFB弱监督区域。当前口径是“连续可靠正降水体素内部的条件梯度”，不包含有效零雨以及雨顶/雨底发生边界，也不能直接与PPT中未明确支持域的“所有样本dR/dz”数值比较。
+
+训练后自动分析会保存总体MAE/RMSE/Bias/R²/Pearson r、预测/标签平均绝对梯度幅值比、符号一致率，以及逐高度、相对CFB距离、目标强度、降水类型和逐轨结果。跨实验比较还会核对完整pair mask的SHA-256指纹，并以整条轨道为单位执行配对bootstrap。
+
+在已有且四个模型完全相同的6条固定测试轨道上，统一复算得到144,497个梯度对；四者支持域指纹完全一致。该结果只是初步诊断，不代替完整验证集封板结论：
+
+| 实验 | dR/dz MAE | dR/dz RMSE | Bias | Pearson r | 绝对梯度幅值比 | 符号一致率 |
+|---|---:|---:|---:|---:|---:|---:|
+| E0 | 0.6561 | 2.2640 | +0.0867 | 0.6905 | 0.7831 | 0.8963 |
+| E0-N | 0.6441 | 2.1984 | +0.0856 | 0.7189 | 0.7723 | **0.9016** |
+| E0-N-I | 0.6467 | **2.0545** | **+0.0339** | **0.7526** | **0.8297** | 0.8962 |
+| E0-N-W | **0.6424** | 2.1483 | +0.0603 | 0.7271 | 0.8244 | 0.9015 |
+
+I在相关性、RMSE和梯度幅值保持上最好；但所有模型的幅值比都明显低于1，说明预测廓线仍有垂直平滑。完整结果生成前不能仅凭6条测试轨道决定是否封板。
+
 ## 4. 项目结构
 
 ```text
@@ -204,12 +303,27 @@ precipitation-inversion/
 │   ├── build_stage1_patch_index.py        # 构建3D核心+上下文窗口索引
 │   ├── check_distributed_runtime.py       # 低显存NCCL/DDP通信自检
 │   ├── launch_stage1_ddp.sh               # 共享服务器安全的单机多卡入口
+│   ├── launch_stage1_ablation_suite.sh    # 消融命令预览/顺序启动与输出防覆盖
 │   ├── train_stage1_unet3d.py             # 单卡/DDP训练、验证和checkpoint
 │   ├── plot_stage1_training_history.py    # 逐epoch曲线、分箱及泛化分析
+│   ├── plot_stage1_stratified_metrics.py  # 高度/CFB/类型/轨道宏指标分析
+│   ├── compare_stage1_drdz.py             # 多实验统一dR/dz与逐轨配对比较
 │   ├── visualize_stage1_test_predictions.py # best.pt固定测试轨道诊断
 │   └── evaluate_stage1_unet3d.py          # Patch指标与完整轨道评估
 ├── configs/
-│   └── stage1_unet3d.yaml                 # 第一版模型和训练参数
+│   ├── stage1_unet3d.yaml                 # 第一版通用模型和训练参数
+│   ├── stage1_ablation_e0_baseline.yaml   # 已训练：三通道基线
+│   ├── stage1_ablation_e1_mask_cfb.yaml   # 已训练：屏蔽CFB以下输入
+│   ├── stage1_ablation_e2_cfb_distance.yaml # 已训练：增加CFB距离通道
+│   ├── stage1_ablation_e3_weighted_from_e1.yaml # 暂缓：E1旧多因素分支
+│   ├── stage1_ablation_e3_weighted_from_e2.yaml # 暂缓：E2旧多因素分支
+│   ├── stage1_ablation_e4_weak_from_e1.yaml     # 暂缓：E1旧弱监督分支
+│   ├── stage1_ablation_e4_weak_from_e2.yaml     # 暂缓：E2旧弱监督分支
+│   ├── stage1_ablation_e0_n_dbz_valid.yaml  # 待训练：输入归一化解耦
+│   ├── stage1_ablation_e0_n_i_intensity.yaml # 待训练：再加强度权重
+│   ├── stage1_ablation_e0_n_w_weak_cfb.yaml  # 待训练：再加弱CFB监督
+│   ├── stage1_ablation_e0_n_iw_combined.yaml # 条件待训练：组合I与W
+│   └── stage1_ablation_smoke.yaml          # 快速数据/训练链路测试配置
 ├── src/precipitation_inversion/data/
 │   ├── masks.py                           # GR/DPR/降水/cfb统一mask规则
 │   ├── splits.py                          # 分组平衡划分核心逻辑
@@ -244,6 +358,9 @@ precipitation-inversion/
 │   ├── test_distributed_configuration.py  # DDP设备绑定及配置安全检查
 │   ├── test_training_visualization.py     # 训练JSONL解析与图表输出测试
 │   ├── test_prediction_visualization.py   # 固定抽样、指标及诊断图测试
+│   ├── test_normalization_stats_script.py # 输入统计与标签QC解耦测试
+│   ├── test_stratified_visualization.py   # 分层/CFB/轨道宏图表测试
+│   ├── test_drdz_comparison.py            # dR/dz跨实验支持域与比较测试
 │   └── test_training_engine.py            # 参数更新和checkpoint恢复测试
 ├── metadata/manifests/
 │   ├── dataset_manifest.csv              # 254个文件的统计清单
@@ -256,7 +373,8 @@ precipitation-inversion/
 │   ├── split_manifest.csv                # 带split字段的完整清单
 │   └── split_summary.json                # 划分平衡性与泄漏检查
 ├── metadata/normalization/
-│   └── stage1_positive_qc.json           # 阶段一训练集分高度统计量
+│   ├── stage1_positive_qc.json           # 首轮：在标签QC网格拟合的旧统计
+│   └── stage1_dbz_valid.json             # 新一轮：全部有限训练DPR输入统计
 ├── metadata/stage1_indices/              # 本机生成，Git忽略
 │   ├── train.npy / val.npy / test.npy    # 6字节/体素的内存映射索引
 │   └── train.json / val.json / test.json # 索引来源、哈希和文件范围
@@ -428,24 +546,36 @@ trainable = sample.masks["pre_positive_qc"]
 
 ### 6.7 拟合阶段一归一化统计量
 
-默认仅读取 `train_files.txt` 中的175个文件，并与 `split_manifest.csv` 交叉检查，遇到验证或测试文件会直接报错：
-
-```bash
-python scripts/fit_normalization_stats.py --overwrite
-```
-
-默认在 `pre_positive_qc` 网格上按60个高度层分别统计 `dbz_dpr/p/t/q` 的数量、均值、标准差和范围。调试时可限制文件数：
+统计脚本仅读取`train_files.txt`中的175个训练文件，并与`split_manifest.csv`交叉检查，遇到验证或测试文件会直接报错。第二轮阶段一实验使用以下命令；`dbz_dpr`输入口径和`pre_dpr`标签/高度权重参考口径是两个独立参数：
 
 ```bash
 python scripts/fit_normalization_stats.py \
+  --variables dbz_dpr \
+  --selection-mask variable_valid \
+  --height-loss-selection-mask pre_positive_qc \
+  --output metadata/normalization/stage1_dbz_valid.json \
+  --overwrite
+```
+
+`variable_valid`表示每个输入变量分别使用自身全部有限、非fill值拟合每层均值和标准差，不再让标签的降水/CFB条件删除有效输入。`height-loss-selection-mask`只额外记录可靠标签的逐层数量，供未来高度权重使用，绝不能把输入计数误当作标签计数。当前正式文件已生成：`dbz_dpr`共6,822,356个值、60层均非空；独立的`pre_positive_qc`高度参考仍为5,481,557个。
+
+调试时可限制文件数并写到临时位置：
+
+```bash
+python scripts/fit_normalization_stats.py \
+  --variables dbz_dpr \
+  --selection-mask variable_valid \
+  --height-loss-selection-mask pre_positive_qc \
   --max-files 2 \
   --output /tmp/stage1-normalization-smoke.json \
   --overwrite
 ```
 
-正式结果保存在 `metadata/normalization/stage1_positive_qc.json`。统计共使用5,481,557个训练网格；由于 `cfb` 近地面杂波质控，0.125 km和0.375 km两层没有可训练正降水样本，其统计量以 `null` 保存。
+`--max-files` 产物只用于检查统计脚本。其 `processed_file_count < validated_file_count`，`Stage1PatchDataset` 会明确拒绝将它用于训练，避免将小样本调试统计误当正式归一化。
 
-### 6.8 构建并读取阶段一体素索引
+首轮E0/E1/E2保留`metadata/normalization/stage1_positive_qc.json`以保证历史实验可复现。该旧文件把输入统计限制在5,481,557个`pre_positive_qc`标签体素，最低两层输入统计为`null`；后续E0-N系列统一改用`stage1_dbz_valid.json`。
+
+### 6.8 构建并读取阶段一体素索引（前期体素级管线）
 
 按训练、验证、测试文件清单生成索引：
 
@@ -468,6 +598,8 @@ item = dataset[0]
 ```
 
 Dataset以内存映射方式读取索引，并为每个DataLoader进程维护独立的NetCDF文件LRU缓存。索引按文件连续排列；后续训练采样器宜按文件块洗牌，再在块内洗牌，避免全局随机访问反复淘汰缓存。
+
+该体素级接口用于早期数据验证和MLP/逐点模型扩展，不是当前3D U-Net的正式训练入口；当前模型使用6.10节的Patch索引和`Stage1PatchDataset`。
 
 ### 6.9 使用文件块批采样器
 
@@ -502,7 +634,7 @@ for epoch in range(100):
         pass
 ```
 
-设置 `batch_sampler` 后不能再同时设置DataLoader的 `batch_size/shuffle/drop_last`。采样器支持 `num_replicas/rank`；若DDP进程组已初始化，则会自动读取world size和当前rank。默认 `even_batches=True`，会舍弃至多 `world_size-1` 个全局batch，使所有rank执行相同步数，避免同步训练挂起。
+设置`batch_sampler`后不能再同时设置DataLoader的`batch_size/shuffle/drop_last`。采样器支持`num_replicas/rank`；若DDP进程组已初始化，则会自动读取world size和当前rank。默认`even_batches=True`会舍弃至多`world_size-1`个全局batch，使所有rank执行相同步数，适合需要同步反向传播的DDP训练。正式验证入口会显式设置`even_batches=False`并使用无DDP前向collective的已同步裸模型，从而保留每个Patch且不重复；不要把训练采样策略直接套到完整验证。
 
 ### 6.10 构建3D U-Net Patch并重建完整轨道
 
@@ -521,7 +653,7 @@ from precipitation_inversion.data.patch_dataset import Stage1PatchDataset
 
 train_dataset = Stage1PatchDataset(
     "metadata/stage1_patch_indices/train.json",
-    "metadata/normalization/stage1_positive_qc.json",
+    "metadata/normalization/stage1_dbz_valid.json",
     positive_only=True,
 )
 item = train_dataset[0]
@@ -530,8 +662,9 @@ print(item["target"].shape)     # (1,64,64,60)
 print(item["loss_mask"].shape)  # (1,64,64,60)
 ```
 
-训练时 `positive_only=True` 过滤没有正降水loss体素的核心；验证和整轨测试必须使用
-`positive_only=False`，以完整覆盖原始 `nscan`。高度保持3D U-Net只在扫描和横轨
+E0-N系列中三通道依次为：按高度层标准化的`dbz_dpr`、DPR输入有效性mask、缩放到`[-1,1]`的物理高度。缺测反射率只在记录`valid=0`后填成标准化空间的0；横轨和轨道边界padding同样以数值0、mask false填充，不会进入损失。`target`为`log1p(pre_dpr)`，无监督位置以0占位，但必须由`loss_mask=false`区分，不能把占位0理解为无降水标签。
+
+训练时 `positive_only=True` 过滤没有正降水loss体素的核心；逐epoch快速选模也可保持这一设置，而训练后独立完整诊断与整轨测试必须使用 `positive_only=False`，才能覆盖全部Patch、原始 `nscan` 以及只含CFB下原生标签的区域。高度保持3D U-Net只在扫描和横轨
 方向以 `(2,2,1)` 下采样，模型输出 `(B,1,64,64,60)` 后，可使用
 `predict_full_orbit` 自动取每个窗口的中心32扫描线并拼成 `(nscan,49,60)`：
 
@@ -557,20 +690,11 @@ nvidia-smi
 nvidia-smi pmon -c 1
 ```
 
-启动脚本要求显式声明物理GPU，防止共享服务器上误占他人正在使用的卡。例如用物理
-5、6号卡做两卡训练（进程内分别映射为 `cuda:0`、`cuda:1`）：
+启动脚本要求显式声明当时确认空闲的物理GPU，防止共享服务器上误占他人正在使用的卡。下面的`GPU_ID_1,GPU_ID_2`只是待替换占位符，不代表固定推荐卡号；进程内会重新映射为`cuda:0`、`cuda:1`：
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6 \
-STAGE1_MASTER_PORT=29519 \
-scripts/launch_stage1_ddp.sh
-```
-
-八卡均确认空闲时才启动八卡训练：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-STAGE1_NUM_GPUS=8 \
+CUDA_VISIBLE_DEVICES=GPU_ID_1,GPU_ID_2 \
+STAGE1_NUM_GPUS=2 \
 STAGE1_MASTER_PORT=29519 \
 scripts/launch_stage1_ddp.sh
 ```
@@ -579,7 +703,7 @@ scripts/launch_stage1_ddp.sh
 运行低显存通信自检；它检查进程绑定、NCCL collective和DDP梯度同步，不读取NC数据：
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6 .venv/bin/torchrun \
+CUDA_VISIBLE_DEVICES=GPU_ID_1,GPU_ID_2 .venv/bin/torchrun \
   --nnodes=1 --nproc-per-node=2 \
   --master-addr=127.0.0.1 --master-port=29518 \
   scripts/check_distributed_runtime.py
@@ -587,9 +711,7 @@ CUDA_VISIBLE_DEVICES=5,6 .venv/bin/torchrun \
 
 `data.batch_size` 是每张GPU的batch大小，当前为1。有效全局batch为
 `每卡batch × GPU数 × accumulation_steps`；两卡为2、八卡为8。第一轮实验先保持
-学习率 `1e-4`，不要因GPU数自动线性放大；得到稳定曲线后再单独比较学习率。训练与
-验证采样器都保证各rank步数相同，最多舍弃 `world_size-1` 个batch以避免collective
-死锁；训练指标会在所有rank上聚合，checkpoint仅由rank 0写入。
+学习率 `1e-4`，不要因GPU数自动线性放大；得到稳定曲线后再单独比较学习率。训练采样器保持各rank等步数，最多舍弃`world_size-1`个全局batch以避免反向collective死锁；验证采用不等长、互斥分片并绕过DDP前向collective，完整保留299个Patch。指标在所有rank上聚合，checkpoint仅由rank 0写入。
 
 断点恢复和两批次烟雾测试：
 
@@ -608,9 +730,7 @@ python scripts/train_stage1_unet3d.py \
 并按目标降水率 `<1/1–5/5–10/10–30/≥30 mm/h` 分箱。默认以验证集物理空间RMSE
 选择 `best.pt`，同时保存 `last.pt` 和逐epoch checkpoint。
 
-完整训练正常结束后，只有DDP rank 0会自动执行两个后处理脚本。配置由
-`postprocessing` 控制，默认固定随机种子2026，从测试集中有正降水监督的轨道里抽取
-6条完整轨道。所有结果写入本次命令实际指定的output目录：
+完整训练正常结束后，只有DDP rank 0会自动执行训练历史、完整验证和固定测试轨道三类后处理。配置由`postprocessing`控制；测试可视化默认固定随机种子2026，从有正降水监督的测试轨道里抽取6条完整轨道。所有结果写入本次命令实际指定的output目录：
 
 ```text
 outputs/<experiment>/analysis/
@@ -622,6 +742,25 @@ outputs/<experiment>/analysis/
 │   ├── epoch_metrics.csv
 │   ├── summary.json
 │   └── summary.md
+├── full_validation/
+│   ├── metrics.json                     # 遍历437个Patch，主指标仍为可靠mask
+│   └── stratified/
+│       ├── metrics_by_height.csv/png
+│       ├── metrics_by_cfb_distance.csv
+│       ├── metrics_by_precipitation_type.csv
+│       ├── drdz_summary.md
+│       ├── drdz_overall.csv
+│       ├── drdz_by_height.csv/png
+│       ├── drdz_by_cfb_distance.csv
+│       ├── drdz_by_target_intensity.csv
+│       ├── drdz_by_precipitation_type.csv
+│       ├── drdz_grouped.png
+│       ├── drdz_metrics_by_file.csv
+│       ├── drdz_filewise_macro_bootstrap.csv
+│       ├── below_cfb_native_positive.csv/png
+│       ├── metrics_by_file.csv
+│       ├── filewise_macro_bootstrap.csv/png
+│       └── summary.json/md
 └── test_predictions/
     ├── aggregate_diagnostics.png
     ├── summary.json
@@ -637,16 +776,42 @@ outputs/<experiment>/analysis/
 已经训练好的checkpoint；如希望后处理失败也令训练命令返回非零状态，可设置
 `postprocessing.fail_on_error=true`。调试训练时可传入 `--skip-postprocessing`。
 
+`full_validation/metrics.json`的主指标始终使用`reliable_loss_mask`。CFB以下原生正降水只进入`diagnostics.below_cfb_native_positive`；逐文件结果、轨道等权宏平均和95% bootstrap置信区间写入`filewise`，bootstrap默认以完整文件/轨道为重采样单位、种子2026、重复2,000次。物理`dR/dz`默认启用并写入`patch_evaluation.metrics.physical_drdz`；只在临时调试时才使用`--no-physical-drdz`关闭。
+
 已有训练也可随时手动重跑：
 
 ```bash
 python scripts/plot_stage1_training_history.py outputs/stage1_unet3d_3gpu
 
-CUDA_VISIBLE_DEVICES=7 python scripts/visualize_stage1_test_predictions.py \
+CUDA_VISIBLE_DEVICES=GPU_ID python scripts/visualize_stage1_test_predictions.py \
   outputs/stage1_unet3d_3gpu/best.pt \
   --output-dir outputs/stage1_unet3d_3gpu/analysis/test_predictions \
   --sample-count 6 --seed 2026 --device cuda:0
+
+python scripts/evaluate_stage1_unet3d.py \
+  outputs/stage1_unet3d_3gpu/best.pt \
+  --split val --stratified --device cuda:0 \
+  --bootstrap-seed 2026 --bootstrap-replicates 2000 \
+  --output outputs/stage1_unet3d_3gpu/analysis/full_validation/metrics.json
+
+python scripts/plot_stage1_stratified_metrics.py \
+  outputs/stage1_unet3d_3gpu/analysis/full_validation/metrics.json \
+  --output-dir outputs/stage1_unet3d_3gpu/analysis/full_validation/stratified
 ```
+
+E0/N/I/W均完成上述完整验证后，可用同一比较入口核对评价协议、逐体素支持域指纹和逐轨样本数，再生成统一表格、图和相对E0的配对bootstrap：
+
+```bash
+python scripts/compare_stage1_drdz.py \
+  --run E0=outputs/ablations/stage1_e0_baseline/analysis/full_validation/metrics.json \
+  --run N=outputs/ablations/stage1_e0_n_dbz_valid/analysis/full_validation/metrics.json \
+  --run I=outputs/ablations/stage1_e0_n_i_intensity/analysis/full_validation/metrics.json \
+  --run W=outputs/ablations/stage1_e0_n_w_weak_cfb/analysis/full_validation/metrics.json \
+  --baseline E0 \
+  --output-dir outputs/ablations/stage1_drdz_comparison
+```
+
+只要任一输入不是完整验证集，或四组的高度网格、mask定义、pair指纹、逐高度/逐轨支持数不同，比较脚本就会拒绝排序，避免把W的弱监督体素或不完整批次混入结论。
 
 Patch评估及一条完整轨道重建：
 
@@ -666,28 +831,73 @@ python scripts/evaluate_stage1_unet3d.py \
 完整轨道模式把非重叠核心重建为 `(nscan,49,60)`，在 `pre_positive_qc` 上计算
 条件强度指标，并把预测、标签和评价mask保存为压缩NPZ。
 
+### 6.12 复现第二轮E0-N/I/W消融
+
+启动器默认只打印将要执行的命令，不会占用GPU。先预览四组配置、输出目录和端口：
+
+```bash
+STAGE1_ABLATION_PHASE=e0n \
+scripts/launch_stage1_ablation_suite.sh
+```
+
+正式复现前再次检查GPU和端口，并把下面的`GPU_ID_1,GPU_ID_2`替换成当时确实空闲的物理卡编号、把进程数改成编号数量。若从头复现实验，仍应先单独运行E0-N，以隔离新归一化的影响：
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU_ID_1,GPU_ID_2 \
+STAGE1_NUM_GPUS=2 \
+STAGE1_EXECUTE=1 \
+STAGE1_ABLATIONS=e0_n \
+STAGE1_ABLATION_MASTER_PORT_BASE=29820 \
+scripts/launch_stage1_ablation_suite.sh
+```
+
+随后可分别复现强度权重I与弱CFB监督W。逗号分隔的实验会在同一组GPU上顺序执行，不会同时抢占显存：
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU_ID_1,GPU_ID_2 \
+STAGE1_NUM_GPUS=2 \
+STAGE1_EXECUTE=1 \
+STAGE1_ABLATIONS=e0_n_i,e0_n_w \
+STAGE1_ABLATION_MASTER_PORT_BASE=29830 \
+scripts/launch_stage1_ablation_suite.sh
+```
+
+组合项IW仍遵循“只有I和W各自都带来可复现收益时才运行”的预注册条件；当前W没有明确总体收益，因此IW暂缓：
+
+```bash
+CUDA_VISIBLE_DEVICES=GPU_ID_1,GPU_ID_2 \
+STAGE1_NUM_GPUS=2 \
+STAGE1_EXECUTE=1 \
+STAGE1_ABLATIONS=e0_n_iw \
+STAGE1_ABLATION_MASTER_PORT_BASE=29840 \
+scripts/launch_stage1_ablation_suite.sh
+```
+
+输出依次位于`outputs/ablations/stage1_e0_n_dbz_valid`、`stage1_e0_n_i_intensity`、`stage1_e0_n_w_weak_cfb`和`stage1_e0_n_iw_combined`。启动器遇到非空输出目录会拒绝覆盖；需要续训时应单独调用训练脚本并显式传`--resume`，不要删除已有结果。若希望一次顺序运行全部四组，可在确认资源和时间后使用`STAGE1_ABLATION_PHASE=e0n`与`STAGE1_EXECUTE=1`，但不推荐跳过前述逐步判定。
+
 ## 7. 当前限制与待确认事项
 
 1. 已完成按日期隔离的划分，但相邻多日是否属于同一天气过程尚无事件级标注；
 2. 尚未从数据生成代码确认 GR–DPR 最大时间匹配误差；
 3. 尚未确认多雷达重叠区域的合并权重，以及均值是在 dBZ 空间还是线性反射率空间计算；
 4. 尚未确认 `dbz_gr_interp` 的具体插值算法、搜索半径和边界处理；
-5. 尚未完成统一的定量基线评估和学习模型实验；
-6. 当前权重读取器针对仓库提供的 `ZRH_37refine.pth` 固定结构，不用于加载任意 PyTorch checkpoint。
-7. 已在物理5、6号RTX 4090 D上完成两卡NCCL collective、DDP反向传播以及真实NC
-   数据/完整3D U-Net的训练与验证冒烟测试。当前受管执行环境在建立 `TCPStore` 时会
-   重复报告hostname解析警告并使初始化延迟约40秒，但最终通信正确；若用户终端也出现
-   长时间停顿，应检查 `/etc/hosts`、主机名解析、本地socket权限和端口冲突。
-8. 尚未在八卡同时空闲时做八进程实测；代码路径与两卡相同，但正式启动前仍需确认
-   所有目标GPU空闲，并先用8进程运行 `check_distributed_runtime.py`。
+5. 已完成3D U-Net学习模型首轮实验，但传统分层Z–R和插值路线尚未在完全相同的验证mask上形成统一定量基线；
+6. 当前Stage1只评价可靠正降水条件下的强度，不能由现有MAE/RMSE推断无降水检测、降水覆盖范围或虚警能力；标签为DPR遥感产品，CFB以下原生正值置信度更低，只能作为弱监督候选和独立诊断；
+7. E0/E1/E2/N/I/W各只有一个随机种子，且正式配置`deterministic=false`。局部分层收益和6条固定测试轨道结果应视为线索，不是统计稳健结论；
+8. E0-N、E0-N-I和E0-N-W已经完成正式训练；其中只有I在完整验证集条件强度指标上形成明确总体收益，N轻微退化、W总体持平。E0-N-IW尚未训练，不应预先假设I与W组合后仍会受益；
+9. 当前权重读取器针对仓库提供的`ZRH_37refine.pth`固定结构，不用于加载任意PyTorch checkpoint；
+10. 已在RTX 4090 D服务器上完成两卡NCCL collective、DDP反向传播以及真实NC数据/完整3D U-Net的训练与验证冒烟测试。受管执行环境建立`TCPStore`时曾报告hostname解析警告并使初始化延迟约40秒，但最终通信正确；若用户终端长时间停顿，应检查`/etc/hosts`、主机名解析、本地socket权限和端口冲突；
+11. “非等长、不重复”验证分片已经过分片完整性单测，并在E0-N/I/W正式多卡训练中得到相同的1,195,966个可靠验证体素；训练后完整诊断则遍历包含无正降水核心在内的437个唯一Patch；
+12. 尚未在八卡同时空闲时做八进程实测。代码路径与两卡相同，但不能预先假定任何卡空闲；正式启动前应检查目标GPU，并先用对应进程数运行`check_distributed_runtime.py`。
 
 ## 8. 下一阶段计划
 
-1. 正式运行第一版训练并检查学习曲线、过拟合和强降水分箱指标；
-2. 建立现有分层Z–R方法在相同测试mask上的定量指标并与3D U-Net比较；
-3. 比较Smooth L1、MSE、MAE和训练集频率拟合的强降水加权损失；
-4. 增加预测—标签平面图、垂直剖面和强降水误差诊断；
-5. 第一版稳定后再加入 `p/t/q` 做消融，随后进入阶段二GR→DPR分布映射。
+1. 在E0/N/I/W的完整验证集上统一回填物理`dR/dz`，联合检查相关性、RMSE、梯度幅值比、逐高度曲线和逐轨配对bootstrap；固定6条测试轨道只能作为初步诊断；
+2. 若I在完整验证集仍保持强度与垂直梯度的双重优势，则把I作为当前阶段一候选，而不优先训练缺乏单因素支持的IW组合；
+3. 若所有候选的梯度幅值比仍明显小于1，再以I为父模型单独测试小权重的物理梯度损失，避免同时改变网络、输入和监督口径；
+4. 对候选最优方法补充多个随机种子，再根据逐轨bootstrap区间判断收益是否稳定；同时在相同数据划分和评价mask上建立分层Z–R基线；
+5. 条件强度基线稳定后，再设计不泄漏标签mask的“是否降水 + 正降水强度”任务，覆盖当前条件梯度未包含的有效零雨、雨顶和雨底，并单独报告命中、漏报、虚警及强度指标；
+6. 随后进入阶段二GR→DPR反射率域映射，最后再按证据加入`p/t/q`并完成两阶段串联。
 
 ## 9. 参考资料
 

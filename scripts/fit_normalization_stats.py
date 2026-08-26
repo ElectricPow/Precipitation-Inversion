@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Fit per-height normalization statistics from the training split only.
+"""Fit per-height input statistics from the training split only.
 
-Files are processed in contiguous scan chunks through ``read_nc_sample``.  The
-default stage-one configuration uses only CFB-quality-controlled positive DPR
-rain cells and fits ``dbz_dpr``, pressure, temperature, and specific humidity.
-No validation or test value is read when using the default file list.
+Files are processed in contiguous scan chunks through ``read_nc_sample``.  By
+default each variable is fitted from all of *its own* finite, non-fill training
+values.  In particular, DPR input normalization is not selected by the
+``pre_positive_qc`` label mask: finite echoes below CFB remain representable as
+model inputs even though the reliable label loss still excludes them.
+
+An independent per-height ``pre_positive_qc`` count is stored for optional
+height-balanced loss.  Keeping that reference separate prevents input-frequency
+statistics from silently becoming target-loss weights.
 """
 
 from __future__ import annotations
@@ -38,7 +43,10 @@ DEFAULT_SPLIT_MANIFEST = (
     PROJECT_ROOT / "metadata" / "splits" / "split_manifest.csv"
 )
 DEFAULT_OUTPUT = (
-    PROJECT_ROOT / "metadata" / "normalization" / "stage1_positive_qc.json"
+    PROJECT_ROOT
+    / "metadata"
+    / "normalization"
+    / "stage1_dbz_valid.json"
 )
 DEFAULT_VARIABLES = ("dbz_dpr", "p", "t", "q")
 SELECTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
@@ -47,6 +55,22 @@ SELECTION_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "pre_positive_native": ("z", "pre_dpr"),
     "pre_valid_qc": ("z", "pre_dpr", "cfb"),
     "pre_positive_qc": ("z", "pre_dpr", "cfb"),
+}
+HEIGHT_LOSS_SELECTIONS = ("none", "pre_positive_qc")
+
+SELECTION_DESCRIPTIONS = {
+    "variable_valid": (
+        "Each variable uses all of its own finite, non-fill values from the "
+        "training split; no precipitation-label QC mask is applied."
+    ),
+    "pre_valid_native": "Valid native precipitation labels select every variable.",
+    "pre_positive_native": (
+        "Positive native precipitation labels select every variable."
+    ),
+    "pre_valid_qc": "Valid above-CFB precipitation labels select every variable.",
+    "pre_positive_qc": (
+        "Positive above-CFB precipitation labels select every variable."
+    ),
 }
 
 
@@ -65,7 +89,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--selection-mask",
         choices=tuple(SELECTION_DEPENDENCIES),
+        default="variable_valid",
+        help=(
+            "Values used to fit each input variable. The default 'variable_valid' "
+            "decouples input normalization from precipitation-label QC."
+        ),
+    )
+    parser.add_argument(
+        "--height-loss-selection-mask",
+        choices=HEIGHT_LOSS_SELECTIONS,
         default="pre_positive_qc",
+        help=(
+            "Independent mask whose per-height counts support loss weighting; "
+            "use 'none' to omit this reference."
+        ),
     )
     parser.add_argument(
         "--scan-chunk-size",
@@ -102,7 +139,11 @@ def sha256_file(path: Path) -> str:
 def load_file_list(path: Path) -> list[Path]:
     if not path.is_file():
         raise FileNotFoundError(f"File list not found: {path}")
-    paths = [Path(line.strip()).expanduser().resolve() for line in path.read_text().splitlines() if line.strip()]
+    paths = [
+        Path(line.strip()).expanduser().resolve()
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
     if not paths:
         raise ValueError(f"File list is empty: {path}")
     duplicates = len(paths) - len(set(paths))
@@ -186,16 +227,35 @@ def fit_statistics(
     *,
     variables: tuple[str, ...],
     selection_mask: str,
+    height_loss_selection_mask: str = "pre_positive_qc",
     scan_chunk_size: int,
-) -> tuple[dict[str, PerLevelRunningStats], np.ndarray, dict[str, str | None], int]:
+) -> tuple[
+    dict[str, PerLevelRunningStats],
+    np.ndarray,
+    dict[str, str | None],
+    int,
+    np.ndarray | None,
+]:
     if scan_chunk_size <= 0:
         raise ValueError("scan_chunk_size must be positive")
+    if selection_mask not in SELECTION_DEPENDENCIES:
+        raise ValueError(f"unsupported selection_mask: {selection_mask}")
+    if height_loss_selection_mask not in HEIGHT_LOSS_SELECTIONS:
+        raise ValueError(
+            "height_loss_selection_mask must be 'none' or 'pre_positive_qc'"
+        )
     dependencies = SELECTION_DEPENDENCIES[selection_mask]
-    requested = unique_names((*variables, *dependencies))
+    height_dependencies = (
+        ()
+        if height_loss_selection_mask == "none"
+        else SELECTION_DEPENDENCIES[height_loss_selection_mask]
+    )
+    requested = unique_names((*variables, *dependencies, *height_dependencies))
     accumulators: dict[str, PerLevelRunningStats] = {}
     reference_z: np.ndarray | None = None
     units: dict[str, str | None] = {}
     chunk_count = 0
+    height_loss_count: np.ndarray | None = None
 
     for file_index, path in enumerate(paths, start=1):
         nscan = source_nscan(path)
@@ -215,6 +275,8 @@ def fit_statistics(
                     name: PerLevelRunningStats.empty(z.size) for name in variables
                 }
                 units = {name: sample.metadata[name].units for name in variables}
+                if height_loss_selection_mask != "none":
+                    height_loss_count = np.zeros(z.size, dtype=np.int64)
             elif z.shape != reference_z.shape or not np.allclose(
                 z, reference_z, rtol=0.0, atol=1e-6
             ):
@@ -229,6 +291,16 @@ def fit_statistics(
                         f"(nscan,nray,z), got {values.shape}"
                     )
                 accumulators[name].update(values, valid_mask=selected)
+            if height_loss_count is not None:
+                height_mask = sample.masks[height_loss_selection_mask]
+                if height_mask.shape != sample.shape_3d:
+                    raise ValueError(
+                        "height-loss selection mask must have shape "
+                        f"{sample.shape_3d}, got {height_mask.shape}"
+                    )
+                height_loss_count += height_mask.sum(
+                    axis=(0, 1), dtype=np.int64
+                )
             chunk_count += 1
         print(
             f"OK [{file_index}/{len(paths)}] {path.name} nscan={nscan}",
@@ -236,7 +308,7 @@ def fit_statistics(
         )
 
     assert reference_z is not None
-    return accumulators, reference_z, units, chunk_count
+    return accumulators, reference_z, units, chunk_count, height_loss_count
 
 
 def main() -> None:
@@ -260,11 +332,13 @@ def main() -> None:
     print(f"Files selected for this run: {len(selected_paths)}")
     print(f"Variables: {', '.join(variables)}")
     print(f"Selection mask: {args.selection_mask}")
+    print(f"Height-loss selection mask: {args.height_loss_selection_mask}")
     print(f"Scan chunk size: {args.scan_chunk_size}")
-    accumulators, z, units, chunk_count = fit_statistics(
+    accumulators, z, units, chunk_count, height_loss_count = fit_statistics(
         selected_paths,
         variables=variables,
         selection_mask=args.selection_mask,
+        height_loss_selection_mask=args.height_loss_selection_mask,
         scan_chunk_size=args.scan_chunk_size,
     )
 
@@ -284,7 +358,26 @@ def main() -> None:
         "processed_file_count": len(selected_paths),
         "scan_chunk_size": args.scan_chunk_size,
         "processed_chunk_count": chunk_count,
+        "statistics_role": "model_input_normalization",
         "selection_mask": args.selection_mask,
+        "selection_semantics": SELECTION_DESCRIPTIONS[args.selection_mask],
+        "label_qc_applied_to_input_statistics": (
+            args.selection_mask != "variable_valid"
+        ),
+        "height_loss_weight_reference": (
+            None
+            if height_loss_count is None
+            else {
+                "selection_mask": args.height_loss_selection_mask,
+                "semantics": (
+                    "Independent reliable-label counts by physical height; "
+                    "not input-normalization counts."
+                ),
+                "heights_km": z.tolist(),
+                "count": height_loss_count.tolist(),
+                "total_count": int(height_loss_count.sum()),
+            }
+        ),
         "rain_transform": {
             "name": "log1p",
             "forward": "log(1 + R)",
@@ -306,8 +399,14 @@ def main() -> None:
             f"  {name}: values={int(accumulator.count.sum()):,}, "
             f"empty_levels={int((accumulator.count == 0).sum())}"
         )
+    if height_loss_count is not None:
+        print(
+            "  height-loss reference: "
+            f"mask={args.height_loss_selection_mask}, "
+            f"values={int(height_loss_count.sum()):,}, "
+            f"empty_levels={int((height_loss_count == 0).sum())}"
+        )
 
 
 if __name__ == "__main__":
     main()
-
