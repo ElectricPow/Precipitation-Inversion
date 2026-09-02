@@ -22,6 +22,11 @@ from netCDF4 import Dataset as NetCDFDataset
 
 from .dataset import atomic_save_json, atomic_save_npy, sha256_file
 from .nc_reader import NCSample, read_nc_sample
+from .precipitation_type import (
+    TYPE_IGNORE_INDEX,
+    TYPE_UNKNOWN,
+    build_type_target_and_mask,
+)
 from .transforms import PerLevelStandardizer
 
 
@@ -55,7 +60,7 @@ CFB_QUALITY_UNKNOWN = 0
 CFB_QUALITY_RELIABLE = 1
 CFB_QUALITY_WEAK = 2
 CFB_QUALITY_CLUTTER = 3
-PRECIPITATION_TYPE_UNKNOWN = -9999
+PRECIPITATION_TYPE_UNKNOWN = TYPE_UNKNOWN
 PATCH_INDEX_DTYPE = np.dtype(
     [
         ("file_id", "<u2"),
@@ -1054,6 +1059,24 @@ class Stage1PatchDataset(TorchDataset):
             fill_value=PRECIPITATION_TYPE_UNKNOWN,
         )
 
+        # Profile-level auxiliary target. Before reduction, ``core_mask`` and
+        # ``valid_window`` are (input_size,nray,z); ``any(z)`` produces the
+        # two-dimensional (input_size,nray) profile support required by
+        # typePrecip. The target is never appended to ``input_channels``.
+        type_target_window, type_loss_mask_window = build_type_target_and_mask(
+            precipitation_type_window,
+            core_profile_mask=core_mask.any(axis=-1),
+            dpr_profile_support=valid_window.any(axis=-1),
+        )
+        # Horizontal padding only: (input_size,nray) -> (Dp,Hp), e.g.
+        # (64,49) -> (64,64). Padding uses ignore_index/False, not a class.
+        type_target_padded = self._pad_profiles(
+            type_target_window, fill_value=TYPE_IGNORE_INDEX
+        )
+        type_loss_mask_padded = self._pad_profiles(
+            type_loss_mask_window, fill_value=False
+        )
+
         # Stack three (Dp,Hp,z) arrays -> inputs=(3,Dp,Hp,z). The height
         # channel is geometric information, not an additional meteorological
         # observation such as p/t/q.
@@ -1113,6 +1136,14 @@ class Stage1PatchDataset(TorchDataset):
             ),
             "precipitation_type": torch.from_numpy(
                 precipitation_type_padded[np.newaxis, ..., np.newaxis]
+            ),
+            # Auxiliary classification tensors are profile fields, not 3-D
+            # voxel fields: target/mask=(Dp,Hp), batched as (B,Dp,Hp).
+            "type_target": torch.from_numpy(
+                np.ascontiguousarray(type_target_padded)
+            ),
+            "type_loss_mask": torch.from_numpy(
+                np.ascontiguousarray(type_loss_mask_padded)
             ),
             "patch_index": torch.tensor(record_index, dtype=torch.int64),
             "file_id": torch.tensor(file_id, dtype=torch.int64),

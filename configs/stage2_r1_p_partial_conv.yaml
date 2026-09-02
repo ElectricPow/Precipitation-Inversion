@@ -1,0 +1,103 @@
+{
+  "experiment": {
+    "name": "stage2_r1_p_partial_conv",
+    "task": "stage2_r1_p_partial_conv",
+    "deployable": false,
+    "seed": 2026,
+    "output_dir": "outputs/stage2_rethink/r1_p_partial_conv"
+  },
+  "data": {
+    "train_index": "metadata/stage2_patch_indices/train.json",
+    "val_index": "metadata/stage2_patch_indices/val.json",
+    "test_index": "metadata/stage2_patch_indices/test.json",
+    "normalization": "metadata/normalization/stage2_reflectivity.json",
+    "input_channels": [
+      "dbz_dpr_sparse_anchor_standardized",
+      "dpr_sparse_anchor_mask",
+      "dpr_sparse_anchor_distance_scaled",
+      "height_scaled"
+    ],
+    "batch_size": 1,
+    "num_workers": 2,
+    "cache_size": 1,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "sampler": {
+      "epoch_size": null,
+      "fill_fraction_threshold": 0.75,
+      "stratum_weights": {
+        "background": 0.0,
+        "ordinary_target": 0.125,
+        "fill_dominant_target": 0.375,
+        "strong_target": 0.50
+      },
+      "group_by_file": true,
+      "drop_last": false
+    }
+  },
+  "model": {
+    "architecture": "partial_conv_unet3d",
+    "in_channels": 4,
+    "base_channels": 16,
+    "channel_multipliers": [1, 2, 4, 8, 16],
+    "max_groups": 8,
+    "bottleneck_dropout": 0.1
+  },
+  "loss": {
+    "reflectivity": {
+      "beta": 0.2,
+      "intensity_bin_edges_dbz": [25.0, 35.0],
+      "intensity_bin_weights": [1.0, 1.10, 1.25]
+    }
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0001
+  },
+  "scheduler": {
+    "name": "cosine",
+    "eta_min": 0.000001
+  },
+  "training": {
+    "epochs": 60,
+    "accumulation_steps": 1,
+    "grad_clip_norm": 1.0,
+    "amp": true,
+    "amp_initial_scale": 1024.0,
+    "checkpoint_every": 10,
+    "early_stopping": {
+      "enabled": false,
+      "patience": 15,
+      "min_delta": 0.0001,
+      "monitor": "val_loss"
+    }
+  },
+  "evaluation": {
+    "max_batches": null,
+    "dbz_thresholds": [15.0, 25.0, 35.0],
+    "fss_radii": [0, 1, 2, 4],
+    "save_orbits": 6
+  },
+  "postprocessing": {
+    "enabled": true,
+    "fail_on_error": false,
+    "evaluate_test": false,
+    "device": "auto",
+    "stage1_checkpoint": "outputs/ablations/stage1_i_g002_t3d/best.pt",
+    "bootstrap_replicates": 2000,
+    "selection_seed": 2026
+  },
+  "runtime": {
+    "deterministic": false,
+    "distributed": {
+      "backend": "auto",
+      "timeout_seconds": 300,
+      "broadcast_buffers": false,
+      "find_unused_parameters": false,
+      "gradient_as_bucket_view": true,
+      "static_graph": true,
+      "bucket_cap_mb": 25.0
+    }
+  }
+}

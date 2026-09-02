@@ -33,6 +33,9 @@ from precipitation_inversion.data.patch_dataset import (  # noqa: E402
 from precipitation_inversion.inference.sliding_window import predict_full_orbit  # noqa: E402
 from precipitation_inversion.metrics.regression import PrecipitationRegressionMetrics  # noqa: E402
 from precipitation_inversion.models.unet3d import Stage1UNet3D  # noqa: E402
+from precipitation_inversion.models.multitask_unet3d import (  # noqa: E402
+    Stage1MultiTaskUNet3D,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,7 +69,7 @@ def resolve_device(value: str) -> torch.device:
 
 def build_model(config: Mapping[str, Any]) -> Stage1UNet3D:
     values = config["model"]
-    return Stage1UNet3D(
+    common = dict(
         in_channels=int(values["in_channels"]),
         out_channels=int(values["out_channels"]),
         base_channels=int(values["base_channels"]),
@@ -74,6 +77,15 @@ def build_model(config: Mapping[str, Any]) -> Stage1UNet3D:
         max_groups=int(values["max_groups"]),
         bottleneck_dropout=float(values["bottleneck_dropout"]),
     )
+    type_task = config.get("type_task", {})
+    if bool(type_task.get("enabled", False)):
+        head = type_task.get("head", {})
+        return Stage1MultiTaskUNet3D(
+            **common,
+            type_head_kind=str(head.get("kind", "ordered_3d")),
+            type_head_config=head,
+        )
+    return Stage1UNet3D(**common)
 
 
 def select_file_ids(

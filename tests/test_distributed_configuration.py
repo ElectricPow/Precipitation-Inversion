@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import subprocess
 import sys
@@ -84,6 +85,15 @@ class DistributedConfigurationTests(unittest.TestCase):
         self.assertGreater(ddp["timeout_seconds"], 0)
         self.assertTrue(ddp["static_graph"])
         self.assertFalse(ddp["find_unused_parameters"])
+
+    def test_formal_configs_use_disk_safe_checkpoint_cadence(self) -> None:
+        paths = sorted((PROJECT_ROOT / "configs").glob("stage[12]*.yaml"))
+        self.assertTrue(paths)
+        for path in paths:
+            with self.subTest(config=path.name):
+                interval = load_config(path)["training"]["checkpoint_every"]
+                expected = 0 if path.name == "stage1_ablation_smoke.yaml" else 10
+                self.assertEqual(interval, expected)
 
     def test_ablation_configs_change_only_declared_experimental_factors(self) -> None:
         paths = {
@@ -304,6 +314,52 @@ class DistributedConfigurationTests(unittest.TestCase):
             for name in ("e0_n", "e0_n_i", "e0_n_w", "e0_n_iw")
         ]
         self.assertEqual(positions, sorted(positions))
+
+    def test_i_plus_g_configuration_is_a_strict_single_factor_ablation(self) -> None:
+        parent = load_config(
+            PROJECT_ROOT / "configs" / "stage1_ablation_e0_n_i_intensity.yaml"
+        )
+        child = load_config(
+            PROJECT_ROOT
+            / "configs"
+            / "stage1_ablation_e0_n_i_g_drdz_002.yaml"
+        )
+        physical = child["loss"]["physical_gradient"]
+        self.assertEqual(
+            physical, {"enabled": True, "weight": 0.02, "beta": 1.0}
+        )
+        self.assertEqual(child["model"]["in_channels"], 3)
+        self.assertEqual(child["data"]["weak_cfb_layer_weights"], [])
+        self.assertEqual(
+            child["training"]["early_stopping"]["monitor"], "val_rain_rmse"
+        )
+
+        # The only permitted differences are run identity/output and the new
+        # G block. Everything controlling data, I weights, model and optimizer
+        # must remain byte-for-byte equivalent after those fields are removed.
+        parent_comparable = copy.deepcopy(parent)
+        child_comparable = copy.deepcopy(child)
+        for value in (parent_comparable, child_comparable):
+            value["experiment"].pop("name")
+            value["experiment"].pop("output_dir")
+        child_comparable["loss"].pop("physical_gradient")
+        self.assertEqual(child_comparable, parent_comparable)
+
+    def test_ablation_suite_exposes_single_i_plus_g_launch_id(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("STAGE1_ABLATIONS", None)
+        environment.update({"STAGE1_EXECUTE": "0", "STAGE1_ABLATION_PHASE": "ig"})
+        result = subprocess.run(
+            ["bash", str(PROJECT_ROOT / "scripts" / "launch_stage1_ablation_suite.sh")],
+            cwd=PROJECT_ROOT,
+            env=environment,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.assertIn("experiments=e0_n_i_g", result.stdout)
+        self.assertIn("stage1_ablation_e0_n_i_g_drdz_002.yaml", result.stdout)
+        self.assertIn("stage1_e0_n_i_g_drdz_002", result.stdout)
 
     def test_postprocessing_runs_once_with_torchrun_ranks_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

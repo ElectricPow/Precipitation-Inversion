@@ -39,6 +39,9 @@ class RegressionAccumulatorTests(unittest.TestCase):
         self.assertAlmostEqual(result["bias"], 0.0)
         self.assertAlmostEqual(result["r2"], 0.75)
         self.assertAlmostEqual(result["pearson_r"], 1.0)
+        # Pearson is perfect because the ordering is linear, but CCC also
+        # penalizes the smaller prediction variance: 2*cov/(var_p+var_t)=0.8.
+        self.assertAlmostEqual(result["ccc"], 0.8)
 
     def test_streaming_updates_and_merge_equal_one_shot(self) -> None:
         prediction = np.array([1.0, 4.0, 8.0, 3.0], dtype=np.float32)

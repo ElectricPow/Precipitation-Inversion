@@ -46,7 +46,7 @@
     "grad_clip_norm": 1.0,
     "amp": true,
     "amp_initial_scale": 1024.0,
-    "checkpoint_every": 1
+    "checkpoint_every": 10
   },
   "evaluation": {
     "max_batches": null,

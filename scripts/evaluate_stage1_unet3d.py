@@ -27,7 +27,12 @@ from precipitation_inversion.data.patch_dataset import (  # noqa: E402
 from precipitation_inversion.inference.sliding_window import (  # noqa: E402
     predict_full_orbit,
 )
-from precipitation_inversion.losses.masked_losses import MaskedSmoothL1Loss  # noqa: E402
+from precipitation_inversion.losses.masked_losses import (  # noqa: E402
+    build_stage1_loss,
+)
+from precipitation_inversion.losses.masked_classification import (  # noqa: E402
+    MaskedCrossEntropyLoss,
+)
 from precipitation_inversion.metrics.regression import (  # noqa: E402
     FilewisePrecipitationMetrics,
     PhysicalRainGradientMetrics,
@@ -35,6 +40,9 @@ from precipitation_inversion.metrics.regression import (  # noqa: E402
     StratifiedPrecipitationMetrics,
 )
 from precipitation_inversion.models.unet3d import Stage1UNet3D  # noqa: E402
+from precipitation_inversion.models.multitask_unet3d import (  # noqa: E402
+    Stage1MultiTaskUNet3D,
+)
 from precipitation_inversion.training.engine import (  # noqa: E402
     evaluate_one_epoch,
 )
@@ -120,7 +128,7 @@ def json_safe(value: Any) -> Any:
 
 def build_model(config: Mapping[str, Any]) -> Stage1UNet3D:
     values = config["model"]
-    return Stage1UNet3D(
+    common = dict(
         in_channels=int(values["in_channels"]),
         out_channels=int(values["out_channels"]),
         base_channels=int(values["base_channels"]),
@@ -128,6 +136,15 @@ def build_model(config: Mapping[str, Any]) -> Stage1UNet3D:
         max_groups=int(values["max_groups"]),
         bottleneck_dropout=float(values["bottleneck_dropout"]),
     )
+    type_task = config.get("type_task", {})
+    if bool(type_task.get("enabled", False)):
+        head = type_task.get("head", {})
+        return Stage1MultiTaskUNet3D(
+            **common,
+            type_head_kind=str(head.get("kind", "ordered_3d")),
+            type_head_config=head,
+        )
+    return Stage1UNet3D(**common)
 
 
 def resolve_device(value: str) -> torch.device:
@@ -259,7 +276,24 @@ def main() -> None:
         pin_memory=bool(data_config["pin_memory"]),
         persistent_workers=bool(data_config["persistent_workers"]) and workers > 0,
     )
-    criterion = MaskedSmoothL1Loss(beta=float(loss_config["beta"]))
+    # Reconstruct the checkpoint's complete objective, including an optional
+    # physical G term, instead of reporting a legacy primary-only val.loss.
+    criterion = build_stage1_loss(loss_config)
+    type_task = config.get("type_task", {})
+    if bool(type_task.get("enabled", False)):
+        class_weights = type_task.get("resolved_class_weights")
+        if class_weights is None:
+            configured_weights = type_task.get("class_weights")
+            if not isinstance(configured_weights, list):
+                raise ValueError(
+                    "multitask checkpoint lacks resolved train-only class weights"
+                )
+            class_weights = configured_weights
+        type_criterion = MaskedCrossEntropyLoss(class_weights).to(device)
+        type_loss_weight = float(type_task.get("loss_weight", 0.01))
+    else:
+        type_criterion = None
+        type_loss_weight = 0.0
     thresholds = tuple(float(value) for value in loss_config["thresholds_mm_h"])
     amp_enabled = bool(config["training"]["amp"]) and device.type == "cuda"
     filewise_metrics = FilewisePrecipitationMetrics(
@@ -291,6 +325,8 @@ def main() -> None:
         ),
         filewise_metrics=filewise_metrics,
         physical_gradient_metrics=physical_gradient_metrics,
+        type_criterion=type_criterion,
+        type_loss_weight=type_loss_weight,
     )
     result: dict[str, Any] = {
         "checkpoint": str(checkpoint_path),

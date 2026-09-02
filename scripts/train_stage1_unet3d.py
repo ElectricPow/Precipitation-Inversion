@@ -30,18 +30,33 @@ from precipitation_inversion.data.patch_dataset import (  # noqa: E402
     Stage1PatchDataset,
     stage1_patch_dataset_kwargs,
 )
+from precipitation_inversion.data.precipitation_type import (  # noqa: E402
+    TYPE_NAMES,
+    inverse_sqrt_class_weights,
+)
 from precipitation_inversion.data.samplers import FileBlockBatchSampler  # noqa: E402
-from precipitation_inversion.losses.masked_losses import MaskedSmoothL1Loss  # noqa: E402
+from precipitation_inversion.losses.masked_losses import (  # noqa: E402
+    build_stage1_loss,
+)
+from precipitation_inversion.losses.masked_classification import (  # noqa: E402
+    MaskedCrossEntropyLoss,
+)
 from precipitation_inversion.metrics.regression import (  # noqa: E402
     StratifiedPrecipitationMetrics,
 )
 from precipitation_inversion.models.unet3d import Stage1UNet3D  # noqa: E402
+from precipitation_inversion.models.multitask_unet3d import (  # noqa: E402
+    Stage1MultiTaskUNet3D,
+)
 from precipitation_inversion.training.engine import (  # noqa: E402
     evaluate_one_epoch,
     load_checkpoint,
     save_checkpoint,
     seed_everything,
+    should_save_periodic_checkpoint,
     train_one_epoch,
+    validate_checkpoint_every,
+    validate_training_output_directory,
 )
 
 
@@ -160,7 +175,7 @@ def _initialize_distributed(
 
 def build_model(config: Mapping[str, Any]) -> Stage1UNet3D:
     model_config = config["model"]
-    return Stage1UNet3D(
+    common = dict(
         in_channels=int(model_config["in_channels"]),
         out_channels=int(model_config["out_channels"]),
         base_channels=int(model_config["base_channels"]),
@@ -168,6 +183,80 @@ def build_model(config: Mapping[str, Any]) -> Stage1UNet3D:
         max_groups=int(model_config["max_groups"]),
         bottleneck_dropout=float(model_config["bottleneck_dropout"]),
     )
+    type_task = config.get("type_task", {})
+    if bool(type_task.get("enabled", False)):
+        head = type_task.get("head", {})
+        return Stage1MultiTaskUNet3D(
+            **common,
+            type_head_kind=str(head.get("kind", "ordered_3d")),
+            type_head_config=head,
+        )
+    return Stage1UNet3D(**common)
+
+
+def resolve_type_objective(
+    config: dict[str, Any],
+    train_dataset: Stage1PatchDataset,
+    device: torch.device,
+    *,
+    rank: int,
+    world_size: int,
+    max_count_samples: int | None = None,
+) -> tuple[MaskedCrossEntropyLoss | None, float]:
+    """Derive train-only class weights once and broadcast them to all ranks."""
+
+    values = config.get("type_task", {})
+    if not bool(values.get("enabled", False)):
+        return None, 0.0
+    weight = float(values.get("loss_weight", 0.01))
+    if not math.isfinite(weight) or weight <= 0.0:
+        raise ValueError("type_task.loss_weight must be finite and positive")
+    configured = values.get("class_weights", "inverse_sqrt_frequency")
+    if configured == "inverse_sqrt_frequency":
+        counts = torch.zeros(len(TYPE_NAMES), dtype=torch.int64, device=device)
+        # Each rank scans a disjoint strided subset. Every patch contributes
+        # only its non-overlapping core profiles, so halos are never counted.
+        local = torch.zeros(len(TYPE_NAMES), dtype=torch.int64)
+        stop = (
+            len(train_dataset)
+            if max_count_samples is None
+            else min(len(train_dataset), max_count_samples)
+        )
+        for index in range(rank, stop, world_size):
+            sample = train_dataset[index]
+            target = sample["type_target"]
+            mask = sample["type_loss_mask"]
+            local += torch.bincount(
+                target[mask], minlength=len(TYPE_NAMES)
+            ).to(dtype=torch.int64)
+        counts.copy_(local.to(device))
+        if world_size > 1:
+            distributed.all_reduce(counts, op=distributed.ReduceOp.SUM)
+        if max_count_samples is not None:
+            counts = counts.clamp_min(1)
+        class_weights = inverse_sqrt_class_weights(counts.cpu().tolist()).tolist()
+    else:
+        class_weights = [float(value) for value in configured]
+        if len(class_weights) != len(TYPE_NAMES):
+            raise ValueError("type_task.class_weights must contain three values")
+        counts = torch.full((len(TYPE_NAMES),), -1, dtype=torch.int64, device=device)
+    values["resolved_class_names"] = list(TYPE_NAMES)
+    values["resolved_class_counts"] = counts.cpu().tolist()
+    values["resolved_class_weights"] = class_weights
+    if rank == 0:
+        print(
+            "[type-task] "
+            + json.dumps(
+                {
+                    "loss_weight": weight,
+                    "class_counts": values["resolved_class_counts"],
+                    "class_weights": class_weights,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    return MaskedCrossEntropyLoss(class_weights).to(device), weight
 
 
 def _postprocessing_environment() -> dict[str, str]:
@@ -250,22 +339,43 @@ def run_postprocessing(
             str(int(values.get("dpi", 150))),
         ],
     ]
+    if bool(config.get("type_task", {}).get("enabled", False)):
+        commands.append(
+            [
+                sys.executable,
+                str(PROJECT_ROOT / "scripts" / "evaluate_stage1_type_head.py"),
+                str(best_checkpoint),
+                "--split",
+                "val",
+                "--device",
+                str(values.get("device", "auto")),
+                "--output",
+                str(output_dir / "analysis" / "full_validation" / "type_head.json"),
+            ]
+        )
     environment = _postprocessing_environment()
     for command in commands:
         print(f"[postprocessing] running: {' '.join(command)}", flush=True)
         subprocess.run(command, cwd=PROJECT_ROOT, env=environment, check=True)
     analysis_directory = output_dir / "analysis"
     analysis_directory.mkdir(parents=True, exist_ok=True)
-    (analysis_directory / "README.md").write_text(
-        "# Stage-1训练后自动分析\n\n"
-        "- [训练历史、强度分箱和泛化间隙](training_history/summary.md)\n"
+    lines = [
+        "# Stage-1训练后自动分析\n",
+        "- [训练历史、强度分箱和泛化间隙](training_history/summary.md)",
         "- [完整验证集分高度、相对CFB、强度及降水类型分析]"
-        "(full_validation/stratified/summary.md)\n"
+        "(full_validation/stratified/summary.md)",
         "- [物理垂直降水率梯度dR/dz分析]"
-        "(full_validation/stratified/drdz_summary.md)\n"
-        "- [固定测试轨道预测与DPR标签对比](test_predictions/summary.md)\n\n"
-        "详细PNG、CSV、JSON和逐轨NPZ位于对应子目录。\n",
-        encoding="utf-8",
+        "(full_validation/stratified/drdz_summary.md)",
+        "- [固定测试轨道预测与DPR标签对比](test_predictions/summary.md)",
+    ]
+    if bool(config.get("type_task", {}).get("enabled", False)):
+        lines.append(
+            "- [降水类型混淆矩阵、高度打乱与低中高层遮挡]"
+            "(full_validation/type_head.json)"
+        )
+    lines.append("\n详细PNG、CSV、JSON和逐轨NPZ位于对应子目录。")
+    (analysis_directory / "README.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
     )
 
 
@@ -304,6 +414,22 @@ def build_loader(
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    training_config = config["training"]
+    # Immutable epoch snapshots default to a disk-safe ten-epoch cadence.
+    # The normalized value is written into resolved_config.json for auditing.
+    checkpoint_every = validate_checkpoint_every(
+        training_config.get("checkpoint_every", 10)
+    )
+    training_config["checkpoint_every"] = checkpoint_every
+    output_dir = project_path(
+        args.output_dir
+        if args.output_dir is not None
+        else config["experiment"]["output_dir"]
+    )
+    output_dir = validate_training_output_directory(
+        output_dir,
+        resume=args.resume,
+    )
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -341,15 +467,17 @@ def main() -> None:
 
     experiment = config["experiment"]
     data_config = config["data"]
-    training_config = config["training"]
+    if args.smoke_test:
+        # Restricted CI containers may forbid DataLoader resource-sharing
+        # sockets. This affects only the one-epoch smoke configuration.
+        data_config["num_workers"] = 0
+        data_config["persistent_workers"] = False
+        data_config["pin_memory"] = device.type == "cuda"
     loss_config = config["loss"]
     seed = int(experiment["seed"])
     seed_everything(
         seed + rank,
         deterministic=bool(config["runtime"]["deterministic"]),
-    )
-    output_dir = project_path(
-        args.output_dir if args.output_dir is not None else experiment["output_dir"]
     )
     if is_main:
         device_name = (
@@ -407,6 +535,22 @@ def main() -> None:
         val_dataset, config, training=False, seed=seed
     )
 
+    type_criterion, type_loss_weight = resolve_type_objective(
+        config,
+        train_dataset,
+        device,
+        rank=rank,
+        world_size=world_size,
+        max_count_samples=64 if args.smoke_test else None,
+    )
+    # The first resolved-config write precedes Dataset construction for early
+    # failure diagnostics. Overwrite it now with train-only class counts and
+    # the exact weights that checkpoints/evaluation will reuse.
+    if is_main:
+        (output_dir / "resolved_config.json").write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     model: torch.nn.Module = build_model(config).to(device)
     if world_size > 1:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -445,9 +589,9 @@ def main() -> None:
     )
     if scheduler_name not in ("none", "cosine"):
         raise ValueError("scheduler name must be 'none' or 'cosine'")
-    if str(loss_config["name"]).lower() != "masked_smooth_l1":
-        raise ValueError("only masked_smooth_l1 is currently supported")
-    criterion = MaskedSmoothL1Loss(beta=float(loss_config["beta"]))
+    # Training and standalone evaluation share this factory so ``val.loss``
+    # has exactly the same I/G definition before and after checkpointing.
+    criterion = build_stage1_loss(loss_config)
     amp_enabled = bool(training_config["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(
         "cuda",
@@ -531,6 +675,8 @@ def main() -> None:
                 accumulation_steps=int(training_config["accumulation_steps"]),
                 thresholds_mm_h=thresholds,
                 max_batches=max_batches,
+                type_criterion=type_criterion,
+                type_loss_weight=type_loss_weight,
             )
             val_result = evaluate_one_epoch(
                 model,
@@ -541,6 +687,8 @@ def main() -> None:
                 thresholds_mm_h=thresholds,
                 max_batches=max_batches,
                 stratified_metrics=stratified_metrics,
+                type_criterion=type_criterion,
+                type_loss_weight=type_loss_weight,
             )
             if scheduler is not None and train_result.optimizer_steps > 0:
                 scheduler.step()
@@ -605,8 +753,7 @@ def main() -> None:
                         config=config,
                         metrics=checkpoint_metrics,
                     )
-                checkpoint_every = int(training_config["checkpoint_every"])
-                if checkpoint_every > 0 and (epoch + 1) % checkpoint_every == 0:
+                if should_save_periodic_checkpoint(epoch, checkpoint_every):
                     save_checkpoint(
                         output_dir / f"epoch_{epoch:04d}.pt",
                         model,

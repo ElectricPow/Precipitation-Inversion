@@ -1,0 +1,118 @@
+{
+  "experiment": {
+    "name": "stage2_three_channel_native",
+    "seed": 2026,
+    "output_dir": "outputs/stage2_ablations/three_channel_native"
+  },
+  "data": {
+    "train_index": "metadata/stage2_patch_indices/train.json",
+    "val_index": "metadata/stage2_patch_indices/val.json",
+    "test_index": "metadata/stage2_patch_indices/test.json",
+    "normalization": "metadata/normalization/stage2_reflectivity.json",
+    "input_channels": [
+      "dbz_gr_sparse_standardized",
+      "gr_native_available",
+      "height_scaled"
+    ],
+    "batch_size": 1,
+    "num_workers": 2,
+    "cache_size": 1,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "sampler": {
+      "epoch_size": null,
+      "fill_fraction_threshold": 0.75,
+      "stratum_weights": {
+        "background": 0.20,
+        "ordinary_target": 0.10,
+        "fill_dominant_target": 0.30,
+        "strong_target": 0.40
+      },
+      "group_by_file": true,
+      "drop_last": false
+    }
+  },
+  "model": {
+    "in_channels": 3,
+    "base_channels": 16,
+    "channel_multipliers": [1, 2, 4, 8, 16],
+    "max_groups": 8,
+    "bottleneck_dropout": 0.1,
+    "support_prior_probability": 0.04
+  },
+  "loss": {
+    "support": {
+      "name": "bce",
+      "weight": 1.0,
+      "pos_weight": 5.0,
+      "gamma": 2.0,
+      "alpha": 0.25
+    },
+    "reflectivity": {
+      "weight": 1.0,
+      "beta": 0.2
+    }
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.0001
+  },
+  "scheduler": {
+    "name": "cosine",
+    "eta_min": 0.000001
+  },
+  "training": {
+    "epochs": 100,
+    "accumulation_steps": 1,
+    "grad_clip_norm": 1.0,
+    "amp": true,
+    "amp_initial_scale": 1024.0,
+    "checkpoint_every": 10,
+    "early_stopping": {
+      "enabled": true,
+      "patience": 15,
+      "min_delta": 0.0001,
+      "monitor": "val_loss"
+    }
+  },
+  "evaluation": {
+    "max_batches": null,
+    "training_support_threshold": 0.5,
+    "training_fss_radii": [],
+    "fss_radii": [1, 2, 4],
+    "threshold_objective": "csi",
+    "threshold_candidates": [
+      0.05, 0.10, 0.15, 0.20, 0.25,
+      0.30, 0.35, 0.40, 0.45, 0.50,
+      0.55, 0.60, 0.65, 0.70, 0.75,
+      0.80, 0.85, 0.90, 0.95
+    ],
+    "save_orbits": 2
+  },
+  "postprocessing": {
+    "enabled": true,
+    "fail_on_error": false,
+    "compare_task_checkpoints": false,
+    "evaluate_test": false,
+    "visualize_test": false,
+    "test_sample_count": 6,
+    "selection_seed": 2026,
+    "height_km": 2.0,
+    "max_scatter_points": 200000,
+    "device": "auto",
+    "dpi": 150
+  },
+  "runtime": {
+    "deterministic": false,
+    "distributed": {
+      "backend": "auto",
+      "timeout_seconds": 300,
+      "broadcast_buffers": false,
+      "find_unused_parameters": false,
+      "gradient_as_bucket_view": true,
+      "static_graph": true,
+      "bucket_cap_mb": 25.0
+    }
+  }
+}

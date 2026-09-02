@@ -69,11 +69,19 @@ def _load_run(specification: str) -> tuple[str, Path, dict[str, Any]]:
     if value.get("split") != "val":
         raise ValueError(f"{label} is not a validation evaluation")
     if coverage.get("complete_patch_support") is not True:
-        raise ValueError(f"{label} does not cover the complete patch split")
+        raise ValueError(
+            f"{label} is a legacy or incomplete evaluation and does not cover "
+            "the complete patch split. Backfill all runs first with "
+            "`python scripts/backfill_stage1_drdz.py --device cuda:0`."
+        )
     metrics = patch.get("metrics", {}) if isinstance(patch, Mapping) else {}
     drdz = metrics.get("physical_drdz") if isinstance(metrics, Mapping) else None
     if not isinstance(drdz, dict):
-        raise ValueError(f"{label} has no physical_drdz metrics")
+        raise ValueError(
+            f"{label} predates the physical dR/dz evaluator and has no "
+            "physical_drdz metrics. Backfill all runs first with "
+            "`python scripts/backfill_stage1_drdz.py --device cuda:0`."
+        )
     return label, path, drdz
 
 

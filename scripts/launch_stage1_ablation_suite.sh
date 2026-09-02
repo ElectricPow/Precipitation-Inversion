@@ -52,9 +52,10 @@ else
       esac
       ;;
     e0n) STAGE1_ABLATION_IDS=(e0_n e0_n_i e0_n_w e0_n_iw) ;;
+    ig) STAGE1_ABLATION_IDS=(e0_n_i_g) ;;
     *)
       echo "Unknown STAGE1_ABLATION_PHASE=${STAGE1_ABLATION_PHASE}." >&2
-      echo "Choose phase1, weighted, weak, or e0n." >&2
+      echo "Choose phase1, weighted, weak, e0n, or ig." >&2
       exit 2
       ;;
   esac
@@ -111,9 +112,14 @@ config_and_output() {
       STAGE1_OUTPUT="outputs/ablations/stage1_e0_n_iw_combined"
       STAGE1_REQUIRED_FILE="metadata/normalization/stage1_dbz_valid.json"
       ;;
+    e0_n_i_g)
+      STAGE1_CONFIG="configs/stage1_ablation_e0_n_i_g_drdz_002.yaml"
+      STAGE1_OUTPUT="outputs/ablations/stage1_e0_n_i_g_drdz_002"
+      STAGE1_REQUIRED_FILE="metadata/normalization/stage1_dbz_valid.json"
+      ;;
     *)
       echo "Unknown ablation ID '$1'." >&2
-      echo "Choose e0/e1/e2, an e3/e4 branch, or e0_n/e0_n_i/e0_n_w/e0_n_iw." >&2
+      echo "Choose e0/e1/e2, an e3/e4 branch, or e0_n/e0_n_i/e0_n_w/e0_n_iw/e0_n_i_g." >&2
       exit 2
       ;;
   esac

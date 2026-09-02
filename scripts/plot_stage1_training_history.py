@@ -120,7 +120,9 @@ def plot_overview(
     best_epoch = int(epochs[best])
     fig, axes = plt.subplots(3, 3, figsize=(18, 14))
 
-    _plot_line(axes[0, 0], epochs, rows, "train.loss", "val.loss", "Masked Smooth L1")
+    _plot_line(
+        axes[0, 0], epochs, rows, "train.loss", "val.loss", "Configured objective"
+    )
     axes[0, 0].set_title("Optimization objective")
     _plot_line(
         axes[0, 1], epochs, rows,
@@ -185,6 +187,98 @@ def plot_overview(
     plt.close(fig)
 
 
+def plot_loss_components(
+    rows: list[dict[str, Any]], destination: Path, dpi: int
+) -> bool:
+    """Plot I, raw G, weighted G, and contribution fraction when available."""
+
+    epochs = np.asarray([int(row["epoch"]) for row in rows])
+    paths = (
+        ("primary_log_smooth_l1", "Primary I: log1p Smooth-L1"),
+        ("physical_drdz_smooth_l1", "Raw G: physical dR/dz Smooth-L1"),
+        ("weighted_physical_drdz", "Weighted G: lambda_G x raw G"),
+        ("weighted_physical_drdz_fraction", "Weighted G / total objective"),
+    )
+    available = any(
+        np.isfinite(_series(rows, f"train.loss_components.{key}")).any()
+        or np.isfinite(_series(rows, f"val.loss_components.{key}")).any()
+        for key, _ in paths
+    )
+    if not available:
+        return False
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    for axis, (key, title) in zip(axes.flat, paths):
+        axis.plot(
+            epochs,
+            _series(rows, f"train.loss_components.{key}"),
+            label="train",
+        )
+        axis.plot(
+            epochs,
+            _series(rows, f"val.loss_components.{key}"),
+            label="validation",
+        )
+        axis.set_xlabel("Epoch")
+        axis.set_title(title)
+        axis.grid(alpha=0.25)
+        axis.legend()
+    axes[1, 1].set_ylabel("Fraction")
+    fig.suptitle("Stage-1 configured loss components", fontsize=15)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(destination, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def plot_stage3_three_task_loss_components(
+    rows: list[dict[str, Any]], destination: Path, dpi: int
+) -> bool:
+    """Plot C2/D0 physical anchors and rain contribution separately."""
+
+    probe = _series(rows, "train.loss_components.stage2_anchor.support")
+    if not np.isfinite(probe).any():
+        return False
+    epochs = np.asarray([int(row["epoch"]) for row in rows])
+    paths = (
+        ("stage2_anchor.support", "Stage-2 support anchor"),
+        (
+            "stage2_anchor.reflectivity_standardized_dbz",
+            "Stage-2 W1.25 dBZ anchor",
+        ),
+        ("rain_task.primary_log_smooth_l1", "Final-rain primary I"),
+        ("rain_task.physical_drdz_smooth_l1", "Final-rain physical G"),
+        ("weighted_stage2_anchor", "Weighted Stage-2 physical objective"),
+        ("weighted_stage2_fraction", "Stage-2 physical / total objective"),
+        ("weighted_rain_task", "Weighted final-rain objective"),
+        ("weighted_rain_fraction", "Final rain / total objective"),
+    )
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    for axis, (path, title) in zip(axes.flat, paths):
+        axis.plot(
+            epochs,
+            _series(rows, f"train.loss_components.{path}"),
+            label="train",
+        )
+        axis.plot(
+            epochs,
+            _series(rows, f"val.loss_components.{path}"),
+            label="validation",
+        )
+        axis.set_xlabel("Epoch")
+        axis.set_title(title)
+        axis.grid(alpha=0.25)
+        axis.legend()
+    axes[1, 1].set_ylabel("Fraction")
+    axes[1, 3].set_ylabel("Fraction")
+    fig.suptitle(
+        "Stage-3 support/dBZ/rain objective components", fontsize=15
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(destination, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def plot_intensity_bins(rows: list[dict[str, Any]], destination: Path, dpi: int) -> None:
     epochs = np.asarray([int(row["epoch"]) for row in rows])
     best_epoch = int(epochs[_best_position(rows)])
@@ -212,6 +306,35 @@ def plot_intensity_bins(rows: list[dict[str, Any]], destination: Path, dpi: int)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(destination, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_type_task(rows: list[dict[str, Any]], destination: Path, dpi: int) -> bool:
+    """Plot auxiliary-loss share and profile classification quality."""
+
+    if not np.isfinite(
+        _series(rows, "val.metrics.precipitation_type.macro_f1")
+    ).any():
+        return False
+    epochs = np.asarray([int(row["epoch"]) for row in rows])
+    figure, axes = plt.subplots(2, 3, figsize=(17, 9), constrained_layout=True)
+    paths = (
+        ("loss_components.type_cross_entropy", "Type cross entropy"),
+        ("loss_components.weighted_type_fraction", "Weighted type / total loss"),
+        ("metrics.precipitation_type.macro_f1", "Macro-F1"),
+        ("metrics.precipitation_type.balanced_accuracy", "Balanced accuracy"),
+        ("metrics.precipitation_type.per_class.convective.recall", "Convective recall"),
+        ("metrics.precipitation_type.accuracy", "Overall accuracy"),
+    )
+    for axis, (suffix, title) in zip(axes.flat, paths):
+        axis.plot(epochs, _series(rows, f"train.{suffix}"), label="train")
+        axis.plot(epochs, _series(rows, f"val.{suffix}"), label="validation")
+        axis.set(title=title, xlabel="Epoch")
+        axis.grid(alpha=0.25)
+        axis.legend()
+    figure.suptitle("DPR precipitation-type auxiliary task")
+    figure.savefig(destination, dpi=dpi, bbox_inches="tight")
+    plt.close(figure)
+    return True
 
 
 def plot_generalization(rows: list[dict[str, Any]], destination: Path, dpi: int) -> None:
@@ -270,6 +393,15 @@ def write_summary(
         "final_training_rain": final["train"]["metrics"]["rain"]["all"],
         "best_validation_loss": best["val"]["loss"],
         "final_validation_loss": final["val"]["loss"],
+        "best_validation_loss_components": best["val"].get(
+            "loss_components", {}
+        ),
+        "final_validation_loss_components": final["val"].get(
+            "loss_components", {}
+        ),
+        "best_validation_precipitation_type": best["val"].get("metrics", {}).get(
+            "precipitation_type"
+        ),
         "final_global_step": final["global_step"],
         "configuration": config,
     }
@@ -280,6 +412,9 @@ def write_summary(
     data = config.get("data", {})
     training = config.get("training", {})
     optimizer = config.get("optimizer", {})
+    loss_config = config.get("loss", {})
+    gradient_config = loss_config.get("physical_gradient", {})
+    type_config = config.get("type_task", {})
     rain = summary["best_validation_rain"]
     markdown = f"""# Stage-1训练曲线摘要
 
@@ -301,7 +436,9 @@ def write_summary(
 - 初始学习率：{optimizer.get('learning_rate')}
 - 权重衰减：{optimizer.get('weight_decay')}
 - AMP：{training.get('amp')}
-- 损失：{config.get('loss', {}).get('name')}
+- 主损失：{loss_config.get('name')}（beta={loss_config.get('beta')}）
+- 物理G损失：enabled={gradient_config.get('enabled', False)}，lambda={gradient_config.get('weight', 0.0)}，beta={gradient_config.get('beta', 1.0)}
+- 类型辅助任务：enabled={type_config.get('enabled', False)}，head={type_config.get('head', {}).get('kind')}，lambda={type_config.get('loss_weight', 0.0)}，rain_feedback={type_config.get('rain_feedback', False)}
 
 详细逐epoch数值见 `epoch_metrics.csv`，原始完整配置及摘要见 `summary.json`。
 """
@@ -325,6 +462,11 @@ def generate_training_analysis(
     if not isinstance(config, dict):
         raise ValueError("resolved_config.json root must be a mapping")
     plot_overview(rows, config, destination / "training_overview.png", dpi)
+    plot_loss_components(rows, destination / "loss_components.png", dpi)
+    plot_stage3_three_task_loss_components(
+        rows, destination / "stage3_multitask_loss_components.png", dpi
+    )
+    plot_type_task(rows, destination / "type_task_history.png", dpi)
     plot_intensity_bins(rows, destination / "validation_intensity_bins.png", dpi)
     plot_generalization(rows, destination / "generalization_gap.png", dpi)
     write_epoch_csv(rows, destination / "epoch_metrics.csv")

@@ -250,6 +250,8 @@ class Stage1PatchDatasetTests(unittest.TestCase):
         self.assertEqual(tuple(item["height_index"].shape), (1, 1, 1, 6))
         self.assertEqual(tuple(item["cfb_profile_valid"].shape), (1, 64, 16, 1))
         self.assertEqual(tuple(item["precipitation_type"].shape), (1, 64, 16, 1))
+        self.assertEqual(tuple(item["type_target"].shape), (64, 16))
+        self.assertEqual(tuple(item["type_loss_mask"].shape), (64, 16))
         self.assertEqual(item["inputs"].dtype, item["target"].dtype)
         self.assertEqual(item["loss_mask"].dtype, __import__("torch").bool)
         self.assertEqual(item["unpadded_shape"].tolist(), [64, 5, 6])
@@ -291,6 +293,11 @@ class Stage1PatchDatasetTests(unittest.TestCase):
         )
         self.assertAlmostEqual(float(item["cfb_distance_km"][0, 26, 0, 0]), -0.25)
         self.assertEqual(int(item["precipitation_type"][0, 16, 0, 0]), 1)
+        # Only class-valid profiles in this patch's unique core and with at
+        # least one native DPR echo become classification supervision.
+        self.assertEqual(int(item["type_loss_mask"].sum()), 2)
+        self.assertEqual(int(item["type_target"][16, 0]), 0)  # source code 1
+        self.assertEqual(int(item["type_target"][47, 1]), 1)  # source code 2
 
     def test_halo_is_input_context_but_not_second_cores_loss(self) -> None:
         item = self.dataset[1]  # core [32,64), context window [16,80)

@@ -13,6 +13,8 @@ from typing import Any
 
 import numpy as np
 
+from precipitation_inversion.models.multitask_unet3d import rain_prediction_from_output
+
 
 try:
     import torch
@@ -239,9 +241,7 @@ def predict_full_orbit(
                     device_type=resolved_device.type,
                     enabled=autocast_enabled,
                 ):
-                    prediction_log = model(inputs)
-                if not isinstance(prediction_log, torch.Tensor):
-                    raise TypeError("model must return a PyTorch Tensor")
+                    prediction_log = rain_prediction_from_output(model(inputs))
                 if (
                     prediction_log.ndim != 5
                     or prediction_log.shape[0] != inputs.shape[0]

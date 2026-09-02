@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from precipitation_inversion.losses.masked_losses import (  # noqa: E402
     MaskedSmoothL1Loss,
+    Stage1CompositeLoss,
 )
 from precipitation_inversion.metrics.regression import (  # noqa: E402
     FilewisePrecipitationMetrics,
@@ -25,7 +26,10 @@ from precipitation_inversion.training.engine import (  # noqa: E402
     load_checkpoint,
     save_checkpoint,
     seed_everything,
+    should_save_periodic_checkpoint,
     train_one_epoch,
+    validate_checkpoint_every,
+    validate_training_output_directory,
 )
 
 
@@ -243,6 +247,72 @@ class TrainingEngineTests(unittest.TestCase):
             weak_result.metrics["physical_drdz"]["all"]["count"], 0
         )
 
+    def test_composite_gradient_loss_is_logged_with_its_own_pair_support(self) -> None:
+        criterion = Stage1CompositeLoss(
+            primary_beta=0.2,
+            physical_gradient_weight=0.02,
+            physical_gradient_beta=1.0,
+        )
+        result = evaluate_one_epoch(
+            self.model,
+            self.loader,
+            criterion,
+            "cpu",
+            use_amp=False,
+            max_batches=2,
+        )
+        components = result.loss_components
+        # Each batch has four horizontal profiles and two valid vertical pairs.
+        self.assertEqual(components["physical_drdz_pair_count"], 16)
+        self.assertTrue(components["physical_drdz_enabled"])
+        self.assertEqual(components["physical_drdz_weight"], 0.02)
+        self.assertAlmostEqual(
+            result.loss,
+            components["primary_log_smooth_l1"]
+            + components["weighted_physical_drdz"],
+            places=7,
+        )
+
+        weak_loader = torch.utils.data.DataLoader(
+            WeightedTinyDataset(), batch_size=1
+        )
+        weak_result = evaluate_one_epoch(
+            torch.nn.Conv3d(3, 1, kernel_size=1),
+            weak_loader,
+            criterion,
+            "cpu",
+            use_amp=False,
+        )
+        # loss_mask contains reliable+weak endpoints, but G receives the
+        # reliable mask and therefore cannot form a pair through W's label.
+        self.assertEqual(
+            weak_result.loss_components["physical_drdz_pair_count"], 0
+        )
+        self.assertEqual(
+            weak_result.loss_components["physical_drdz_smooth_l1"], 0.0
+        )
+
+    def test_composite_gradient_loss_trains_and_backpropagates(self) -> None:
+        criterion = Stage1CompositeLoss(
+            primary_beta=0.2,
+            physical_gradient_weight=0.02,
+            physical_gradient_beta=1.0,
+        )
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-3)
+        before = self.model.weight.detach().clone()
+        result = train_one_epoch(
+            self.model,
+            self.loader,
+            optimizer,
+            criterion,
+            "cpu",
+            use_amp=False,
+            max_batches=1,
+        )
+        self.assertEqual(result.loss_components["physical_drdz_pair_count"], 8)
+        self.assertTrue(math.isfinite(result.loss))
+        self.assertFalse(torch.equal(before, self.model.weight.detach()))
+
     def test_checkpoint_round_trip_restores_model_optimizer_and_metadata(self) -> None:
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-2)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5)
@@ -312,6 +382,50 @@ class TrainingEngineTests(unittest.TestCase):
                 self.criterion,
                 "cpu",
                 max_batches=0,
+            )
+
+    def test_periodic_checkpoint_policy_uses_zero_based_0009_cadence(self) -> None:
+        self.assertEqual(validate_checkpoint_every(), 10)
+        due = [
+            epoch
+            for epoch in range(30)
+            if should_save_periodic_checkpoint(epoch)
+        ]
+        self.assertEqual(due, [9, 19, 29])
+        self.assertTrue(should_save_periodic_checkpoint(19, 20))
+        self.assertFalse(should_save_periodic_checkpoint(9, 20))
+        self.assertFalse(should_save_periodic_checkpoint(999, 0))
+
+    def test_periodic_checkpoint_policy_rejects_unsafe_intervals(self) -> None:
+        for value in (-1, 1, 9):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_checkpoint_every(value)
+        for value in (True, 10.0, "10"):
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                validate_checkpoint_every(value)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            should_save_periodic_checkpoint(-1)
+        with self.assertRaises(TypeError):
+            should_save_periodic_checkpoint(True)  # type: ignore[arg-type]
+
+    def test_output_directory_guard_only_allows_existing_history_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "run"
+            output_dir.mkdir()
+            self.assertEqual(
+                validate_training_output_directory(output_dir),
+                output_dir.resolve(),
+            )
+            (output_dir / "metrics.jsonl").write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                validate_training_output_directory(output_dir)
+            with self.assertRaises(FileExistsError):
+                validate_training_output_directory(
+                    output_dir, initialize_from="source_best.pt"
+                )
+            self.assertEqual(
+                validate_training_output_directory(output_dir, resume="last.pt"),
+                output_dir.resolve(),
             )
 
 

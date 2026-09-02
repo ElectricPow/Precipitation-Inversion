@@ -43,11 +43,23 @@ def epoch_row(epoch: int, train_value: float, val_value: float) -> dict:
         "learning_rate": 1e-4 / (epoch + 1),
         "train": {
             "loss": train_value,
+            "loss_components": {
+                "primary_log_smooth_l1": train_value * 0.9,
+                "physical_drdz_smooth_l1": train_value * 5.0,
+                "weighted_physical_drdz": train_value * 0.1,
+                "weighted_physical_drdz_fraction": 0.1,
+            },
             "duration_seconds": 2.0,
             "metrics": {"log": metric(train_value), "rain": {"all": metric(train_value)}},
         },
         "val": {
             "loss": val_value,
+            "loss_components": {
+                "primary_log_smooth_l1": val_value * 0.9,
+                "physical_drdz_smooth_l1": val_value * 5.0,
+                "weighted_physical_drdz": val_value * 0.1,
+                "weighted_physical_drdz_fraction": 0.1,
+            },
             "duration_seconds": 0.5,
             "metrics": {
                 "log": metric(val_value),
@@ -79,6 +91,7 @@ class TrainingVisualizationTests(unittest.TestCase):
             self.assertEqual(summary["best_epoch_by_validation_rain_rmse"], 1)
             for name in (
                 "training_overview.png",
+                "loss_components.png",
                 "validation_intensity_bins.png",
                 "generalization_gap.png",
                 "epoch_metrics.csv",
@@ -87,6 +100,12 @@ class TrainingVisualizationTests(unittest.TestCase):
             ):
                 self.assertTrue((analysis / name).is_file(), name)
                 self.assertGreater((analysis / name).stat().st_size, 0)
+            self.assertEqual(
+                summary["best_validation_loss_components"][
+                    "weighted_physical_drdz_fraction"
+                ],
+                0.1,
+            )
 
     def test_invalid_json_line_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

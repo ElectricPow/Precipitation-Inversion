@@ -98,7 +98,13 @@ class Stage1UNet3D(nn.Module):
         nn.init.normal_(self.output_head.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.output_head.bias)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Return the last decoder feature volume ``(B,base,D,H,Z)``.
+
+        Exposing this tensor lets diagnostic probes and auxiliary heads reuse
+        exactly the same backbone without changing the historical rain head.
+        """
+
         if inputs.ndim != 5:
             raise ValueError("inputs must have shape (B,C,nscan,nray,z)")
         if inputs.shape[1] != self.in_channels:
@@ -125,5 +131,9 @@ class Stage1UNet3D(nn.Module):
         for up, skip in zip(self.decoder, reversed(skips[:-1])):
             features = up(features, skip)
 
+        return features
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        features = self.forward_features(inputs)
         # Linear head: (B,base,64,64,60) -> log-rain (B,1,64,64,60).
         return self.output_head(features)

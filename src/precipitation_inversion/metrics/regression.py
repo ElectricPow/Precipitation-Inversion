@@ -117,6 +117,7 @@ def _metrics_from_statistics(values: Sequence[float]) -> dict[str, float | int]:
             "bias": math.nan,
             "r2": math.nan,
             "pearson_r": math.nan,
+            "ccc": math.nan,
         }
     (
         _,
@@ -138,6 +139,20 @@ def _metrics_from_statistics(values: Sequence[float]) -> dict[str, float | int]:
         max(prediction_centered, 0.0) * max(target_centered, 0.0)
     )
     pearson = covariance / denominator if denominator > 0.0 else math.nan
+    # Lin's concordance correlation coefficient additionally penalizes mean
+    # and variance mismatch; unlike Pearson r it cannot reward a consistently
+    # biased/scaled prediction. This uses population moments, for which the
+    # common factor 1/count cancels from numerator and denominator.
+    concordance_denominator = (
+        prediction_centered
+        + target_centered
+        + (sum_prediction - sum_target) ** 2 / count
+    )
+    ccc = (
+        2.0 * covariance / concordance_denominator
+        if concordance_denominator > 0.0
+        else math.nan
+    )
     r2 = (
         1.0 - sum_squared_error / target_centered
         if target_centered > 0.0
@@ -150,6 +165,7 @@ def _metrics_from_statistics(values: Sequence[float]) -> dict[str, float | int]:
         "bias": sum_error / count,
         "r2": r2,
         "pearson_r": pearson,
+        "ccc": ccc,
     }
 
 
@@ -603,7 +619,7 @@ class FilewisePrecipitationMetrics:
     spatial dependence among voxels from the same orbit.
     """
 
-    _METRIC_NAMES = ("mae", "rmse", "bias", "r2", "pearson_r")
+    _METRIC_NAMES = ("mae", "rmse", "bias", "r2", "pearson_r", "ccc")
 
     def __init__(
         self,
